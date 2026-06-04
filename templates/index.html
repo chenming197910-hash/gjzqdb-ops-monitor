@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OB 运维监控平台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <nav class="nav">
+    <a class="active" href="#">首页</a>
+    <a href="#">运维总览 <span></span></a>
+    <a href="#">任务监控 <span></span></a>
+    <a href="#">平台监控 <span></span></a>
+    <a href="#">集市监控 <span></span></a>
+    <a href="#">数据链路 <span></span></a>
+    <a href="#">上线管理 <span></span></a>
+    <a href="#">运维管理 <span></span></a>
+  </nav>
+
+  <header class="toolbar">
+    <div class="refresh">
+      <strong>自动刷新：</strong>
+      <label class="switch">
+        <input id="autoRefresh" type="checkbox" checked>
+        <i></i>
+      </label>
+      <select id="refreshSeconds">
+        <option value="5">5秒</option>
+        <option value="10">10秒</option>
+        <option value="30">30秒</option>
+      </select>
+    </div>
+    <div class="title">OB 数据库运维全景</div>
+  </header>
+
+  <main class="dashboard">
+    <section class="hero-metrics" id="heroMetrics"></section>
+    <section class="cluster-grid" id="clusterCards"></section>
+    <section class="system-strip" id="systemCards"></section>
+
+    <section class="event-panel">
+      <div class="panel-head">
+        <h2>告警与错误日志</h2>
+        <div class="actions">
+          <button class="ghost" id="openOcp">OCP接入</button>
+          <button class="ghost" id="syncOcp">同步OCP</button>
+          <button class="ghost" id="runCollect">执行采集</button>
+          <button class="ghost" id="openLogCapture">录入日志</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>发生时间</th>
+              <th>告警级别</th>
+              <th>主机</th>
+              <th>事件</th>
+              <th>应用名称</th>
+              <th>应用负责人</th>
+            </tr>
+          </thead>
+          <tbody id="eventRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="ocpDialog">
+    <form id="ocpForm" method="dialog">
+      <div class="dialog-head">
+        <h2>配置 OCP 接入</h2>
+        <button type="button" class="close" id="closeOcpDialog">×</button>
+      </div>
+      <label>连接名称<input name="name" required placeholder="生产OCP"></label>
+      <label>OCP地址<input name="base_url" required placeholder="https://ocp.example.com"></label>
+      <label>OCP版本<input name="ocp_version" value="4.3.5-20250610160438"></label>
+      <label>API前缀<input name="api_prefix" value="/api/v2"></label>
+      <label>认证方式
+        <select name="auth_type">
+          <option value="basic">账号密码</option>
+          <option value="token">Bearer Token</option>
+        </select>
+      </label>
+      <label>用户名<input name="username" placeholder="admin"></label>
+      <label>密码<input name="password" type="password"></label>
+      <label>Token<input name="token" placeholder="可选"></label>
+      <label class="check"><input name="verify_ssl" type="checkbox" checked> 校验HTTPS证书</label>
+      <button type="submit">保存配置</button>
+      <p class="hint">按 OCP 4.3.5 预置：测试调用 /api/v2/info，同步调用 /api/v2/ob/clusters。OB 默认版本按 4.2.1.8 入库。</p>
+    </form>
+  </dialog>
+
+  <dialog id="logDialog">
+    <form id="logForm" method="dialog">
+      <div class="dialog-head">
+        <h2>捕获 OB 错误日志</h2>
+        <button type="button" class="close" id="closeLogDialog">×</button>
+      </div>
+      <label>集群 ID<input name="cluster_id" type="number" placeholder="可选"></label>
+      <label>服务器 IP<input name="server_ip" placeholder="10.10.20.11"></label>
+      <label>日志路径<input name="log_path" placeholder="/home/admin/oceanbase/log/observer.log"></label>
+      <label>日志内容
+        <textarea name="raw_log" required placeholder="粘贴 observer.log / election.log / rootservice.log 中的 ERROR、WARN、FATAL 片段"></textarea>
+      </label>
+      <button type="submit">解析并入库</button>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
