@@ -7,106 +7,344 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <nav class="nav">
-    <a class="active" href="#">首页</a>
-    <a href="#">运维总览 <span></span></a>
-    <a href="#">任务监控 <span></span></a>
-    <a href="#">平台监控 <span></span></a>
-    <a href="#">集市监控 <span></span></a>
-    <a href="#">数据链路 <span></span></a>
-    <a href="#">上线管理 <span></span></a>
-    <a href="#">运维管理 <span></span></a>
-  </nav>
-
-  <header class="toolbar">
-    <div class="refresh">
-      <strong>自动刷新：</strong>
-      <label class="switch">
-        <input id="autoRefresh" type="checkbox" checked>
-        <i></i>
-      </label>
-      <select id="refreshSeconds">
-        <option value="5">5秒</option>
-        <option value="10">10秒</option>
-        <option value="30">30秒</option>
-      </select>
+  <header class="topbar">
+    <div>
+      <h1>OB 运维监控平台</h1>
+      <p id="dbInfo">正在检查数据库连接...</p>
     </div>
-    <div class="title">OB 数据库运维全景</div>
+    <div class="top-actions">
+      <label class="refresh">
+        自动刷新
+        <select id="refreshSeconds">
+          <option value="10">10秒</option>
+          <option value="30">30秒</option>
+          <option value="60">60秒</option>
+        </select>
+      </label>
+      <button id="refreshNow">刷新</button>
+    </div>
   </header>
 
-  <main class="dashboard">
-    <section class="hero-metrics" id="heroMetrics"></section>
-    <section class="cluster-grid" id="clusterCards"></section>
-    <section class="system-strip" id="systemCards"></section>
+  <main class="page">
+    <section id="statusBanner" class="status-banner hidden"></section>
 
-    <section class="event-panel">
-      <div class="panel-head">
-        <h2>告警与错误日志</h2>
+    <section class="metrics" id="summaryCards"></section>
+
+    <section class="section resource-section" id="tenantResourceSection">
+      <div class="section-head">
+        <div>
+          <h2>租户资源占比</h2>
+          <p>按租户 CPU 和内存规格展示占比，点击饼图或租户名进入租户详情。</p>
+        </div>
+      </div>
+      <div class="resource-grid">
+        <div class="resource-panel">
+          <h3>CPU 占比</h3>
+          <div id="cpuPie" class="pie-wrap"></div>
+          <div id="cpuTenantList" class="resource-list"></div>
+        </div>
+        <div class="resource-panel">
+          <h3>内存占比</h3>
+          <div id="memoryPie" class="pie-wrap"></div>
+          <div id="memoryTenantList" class="resource-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="clustersSection">
+      <div class="section-head">
+        <div>
+          <h2>OB 集群资产</h2>
+          <p>支持 OCP 同步，也支持手工录入单个 OB 集群。</p>
+        </div>
         <div class="actions">
-          <button class="ghost" id="openOcp">OCP接入</button>
-          <button class="ghost" id="syncOcp">同步OCP</button>
-          <button class="ghost" id="runCollect">执行采集</button>
-          <button class="ghost" id="openLogCapture">录入日志</button>
+          <button class="primary" data-open="clusterModal">新增集群</button>
+          <button data-open="ocpModal">OCP 接入</button>
+          <button id="syncOcp">同步 OCP</button>
         </div>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>发生时间</th>
-              <th>告警级别</th>
-              <th>主机</th>
-              <th>事件</th>
-              <th>应用名称</th>
-              <th>应用负责人</th>
+              <th>ID</th>
+              <th>集群名称</th>
+              <th>环境</th>
+              <th>区域</th>
+              <th>连接地址</th>
+              <th>端口</th>
+              <th>版本</th>
+              <th>租户</th>
+              <th>OBServer</th>
+              <th>状态</th>
+              <th>负责人</th>
+              <th>操作</th>
             </tr>
           </thead>
-          <tbody id="eventRows"></tbody>
+          <tbody id="clusterRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="tenantsSection">
+      <div class="section-head">
+        <div>
+          <h2>租户信息</h2>
+          <p>从 OB 只读采集租户模式、Primary Zone、Locality、主备角色、备份、磁盘和合并信息。</p>
+        </div>
+        <div class="tenant-filters">
+          <label><input id="hideStandbyTenants" type="checkbox" checked> 屏蔽 standby 租户 <span id="hideStandbyState" class="filter-state"></span></label>
+          <label><input id="hideMetaTenants" type="checkbox" checked> 屏蔽 meta 租户 <span id="hideMetaState" class="filter-state"></span></label>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>集群</th>
+              <th>租户</th>
+              <th>模式</th>
+              <th>Primary Zone</th>
+              <th>主备角色</th>
+              <th>主备状态</th>
+              <th>Unit数</th>
+              <th>CPU</th>
+              <th>内存GB</th>
+              <th>上次全备份</th>
+              <th>数据盘</th>
+              <th>日志盘</th>
+              <th>上次成功合并</th>
+              <th>状态</th>
+              <th>Locality</th>
+            </tr>
+          </thead>
+          <tbody id="tenantRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="serversSection">
+      <div class="section-head">
+        <div>
+          <h2>服务器资产</h2>
+          <p>维护 OB 所在主机、操作系统、CPU、内存、磁盘和负责人。</p>
+        </div>
+        <div class="actions">
+          <button class="primary" data-open="serverModal">新增服务器</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>主机名</th>
+              <th>IP</th>
+              <th>机房</th>
+              <th>机架</th>
+              <th>操作系统</th>
+              <th>CPU</th>
+              <th>内存GB</th>
+              <th>磁盘GB</th>
+              <th>状态</th>
+              <th>负责人</th>
+            </tr>
+          </thead>
+          <tbody id="serverRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="logsSection">
+      <div class="section-head">
+        <div>
+          <h2>告警与 OB 日志</h2>
+          <p>粘贴 OB 日志片段后，系统会提取 WARN、ERROR、FATAL、OB/ORA 错误码。</p>
+        </div>
+        <div class="actions">
+          <button data-open="logModal">录入日志</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>级别</th>
+              <th>集群</th>
+              <th>主机</th>
+              <th>错误码</th>
+              <th>组件</th>
+              <th>事件</th>
+            </tr>
+          </thead>
+          <tbody id="logRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="jobsSection">
+      <div class="section-head">
+        <div>
+          <h2>采集任务与错误</h2>
+          <p>这里仅显示目标 OB 连接测试和只读采集摘要；详细错误写入服务器日志 logs/ob-ops-monitor.log。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>时间</th>
+              <th>集群</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>信息</th>
+            </tr>
+          </thead>
+          <tbody id="jobRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="configsSection">
+      <div class="section-head">
+        <div>
+          <h2>本地配置管理</h2>
+          <p>管理保存在后台 Oracle 资产库中的 OCP 接入配置。删除只影响本程序本地配置，不会修改 OCP。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>名称</th>
+              <th>OCP地址</th>
+              <th>认证</th>
+              <th>用户</th>
+              <th>状态</th>
+              <th>上次同步</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="ocpRows"></tbody>
         </table>
       </div>
     </section>
   </main>
 
-  <dialog id="ocpDialog">
-    <form id="ocpForm" method="dialog">
-      <div class="dialog-head">
-        <h2>配置 OCP 接入</h2>
-        <button type="button" class="close" id="closeOcpDialog">×</button>
+  <div class="modal" id="clusterModal">
+    <form id="clusterForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>新增 OB 集群</h2>
+        <button type="button" class="icon-button" data-close="clusterModal">×</button>
       </div>
-      <label>连接名称<input name="name" required placeholder="生产OCP"></label>
-      <label>OCP地址<input name="base_url" required placeholder="https://ocp.example.com"></label>
-      <label>OCP版本<input name="ocp_version" value="4.3.5-20250610160438"></label>
-      <label>API前缀<input name="api_prefix" value="/api/v2"></label>
-      <label>认证方式
-        <select name="auth_type">
-          <option value="basic">账号密码</option>
-          <option value="token">Bearer Token</option>
-        </select>
-      </label>
-      <label>用户名<input name="username" placeholder="admin"></label>
-      <label>密码<input name="password" type="password"></label>
-      <label>Token<input name="token" placeholder="可选"></label>
-      <label class="check"><input name="verify_ssl" type="checkbox" checked> 校验HTTPS证书</label>
-      <button type="submit">保存配置</button>
-      <p class="hint">按 OCP 4.3.5 预置：测试调用 /api/v2/info，同步调用 /api/v2/ob/clusters。OB 默认版本按 4.2.1.8 入库。</p>
+      <div class="form-grid">
+        <label>集群名称<input name="name" required placeholder="例如 gjzq-ob-prod"></label>
+        <label>环境<select name="environment"><option value="prod">生产</option><option value="test">测试</option><option value="dev">开发</option></select></label>
+        <label>区域/机房<input name="region" placeholder="例如 生产中心"></label>
+        <label>连接地址<input name="endpoint" required placeholder="OB RootService 或连接地址"></label>
+        <label>SQL端口<input name="port" type="number" value="2881"></label>
+        <label>系统用户<input name="sys_user" required value="root@sys" placeholder="root@sys 或 root@sys#集群名"></label>
+        <label>系统用户密码<input name="sys_password" type="password" placeholder="用于只读采集 OB 元数据"></label>
+        <label>OB版本<input name="version" value="4.2.1.8"></label>
+        <label>状态<select name="status"><option value="online">online</option><option value="offline">offline</option><option value="unknown">unknown</option></select></label>
+        <label>负责人<input name="owner" value="DBA"></label>
+        <label class="span-2">备注<input name="remark" placeholder="手工录入"></label>
+      </div>
+      <div class="modal-actions"><button type="submit" class="primary">保存集群</button></div>
     </form>
-  </dialog>
+  </div>
 
-  <dialog id="logDialog">
-    <form id="logForm" method="dialog">
-      <div class="dialog-head">
-        <h2>捕获 OB 错误日志</h2>
-        <button type="button" class="close" id="closeLogDialog">×</button>
+  <div class="modal" id="collectConfigModal">
+    <form id="collectConfigForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>配置 OB 只读采集</h2>
+        <button type="button" class="icon-button" data-close="collectConfigModal">×</button>
       </div>
-      <label>集群 ID<input name="cluster_id" type="number" placeholder="可选"></label>
-      <label>服务器 IP<input name="server_ip" placeholder="10.10.20.11"></label>
-      <label>日志路径<input name="log_path" placeholder="/home/admin/oceanbase/log/observer.log"></label>
-      <label>日志内容
-        <textarea name="raw_log" required placeholder="粘贴 observer.log / election.log / rootservice.log 中的 ERROR、WARN、FATAL 片段"></textarea>
-      </label>
-      <button type="submit">解析并入库</button>
+      <input name="cluster_id" type="hidden">
+      <div class="form-grid">
+        <label>连接地址<input name="endpoint" required placeholder="OB SQL 地址，例如 192.168.62.62"></label>
+        <label>SQL端口<input name="port" type="number" value="2881"></label>
+        <label>系统用户<input name="sys_user" required value="root@sys" placeholder="root@sys 或 root@sys#集群名"></label>
+        <label>系统用户密码<input name="sys_password" type="password" placeholder="留空则保留原密码"></label>
+      </div>
+      <p class="form-note">只读采集只会连接 OB 执行 SELECT，不会对 OB 做任何修改。</p>
+      <div class="modal-actions"><button type="submit" class="primary">保存采集配置</button></div>
     </form>
-  </dialog>
+  </div>
+
+  <div class="modal" id="serverModal">
+    <form id="serverForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>新增服务器</h2>
+        <button type="button" class="icon-button" data-close="serverModal">×</button>
+      </div>
+      <div class="form-grid">
+        <label>主机名<input name="hostname" required placeholder="例如 ob01"></label>
+        <label>IP地址<input name="ip" required placeholder="例如 10.50.40.10"></label>
+        <label>机房<input name="idc"></label>
+        <label>机架<input name="rack"></label>
+        <label>操作系统<input name="os_version" value="RHEL 7.9"></label>
+        <label>CPU核数<input name="cpu_cores" type="number" value="0"></label>
+        <label>内存GB<input name="memory_gb" type="number" value="0"></label>
+        <label>磁盘GB<input name="disk_gb" type="number" value="0"></label>
+        <label>SSH端口<input name="ssh_port" type="number" value="22"></label>
+        <label>状态<select name="status"><option value="online">online</option><option value="offline">offline</option><option value="unknown">unknown</option></select></label>
+        <label>负责人<input name="owner" value="DBA"></label>
+      </div>
+      <div class="modal-actions"><button type="submit" class="primary">保存服务器</button></div>
+    </form>
+  </div>
+
+  <div class="modal" id="ocpModal">
+    <form id="ocpForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>配置 OCP 接入</h2>
+        <button type="button" class="icon-button" data-close="ocpModal">×</button>
+      </div>
+      <div class="form-grid">
+        <label>连接名称<input name="name" required placeholder="生产 OCP"></label>
+        <label>OCP地址<input name="base_url" required placeholder="https://ocp.example.com"></label>
+        <label>OCP版本<input name="ocp_version" value="4.3.5-20250610160438"></label>
+        <label>API前缀<input name="api_prefix" value="/api/v2"></label>
+        <label>认证方式<select name="auth_type"><option value="basic">账号密码</option><option value="token">Bearer Token</option></select></label>
+        <label>用户名<input name="username"></label>
+        <label>密码<input name="password" type="password"></label>
+        <label>Token<input name="token"></label>
+        <label class="check span-2"><input name="verify_ssl" type="checkbox" checked> 校验 HTTPS 证书</label>
+      </div>
+      <div class="modal-actions"><button type="submit" class="primary">保存并测试</button></div>
+    </form>
+  </div>
+
+  <div class="modal" id="logModal">
+    <form id="logForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>录入 OB 日志</h2>
+        <button type="button" class="icon-button" data-close="logModal">×</button>
+      </div>
+      <div class="form-grid">
+        <label>集群 ID<input name="cluster_id" type="number" placeholder="可选"></label>
+        <label>服务器 IP<input name="server_ip"></label>
+        <label class="span-2">日志路径<input name="log_path" placeholder="/home/admin/oceanbase/log/observer.log"></label>
+        <label class="span-2">日志内容<textarea name="raw_log" required></textarea></label>
+      </div>
+      <div class="modal-actions"><button type="submit" class="primary">解析并入库</button></div>
+    </form>
+  </div>
+
+  <div class="modal" id="detailModal">
+    <div class="modal-panel wide">
+      <div class="modal-head">
+        <h2 id="detailTitle">集群详情</h2>
+        <button type="button" class="icon-button" data-close="detailModal">×</button>
+      </div>
+      <div id="detailBody"></div>
+    </div>
+  </div>
 
   <div class="toast" id="toast"></div>
   <script src="/static/app.js"></script>

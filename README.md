@@ -16,27 +16,45 @@
 - Oracle 资产库：保存集群、服务器、租户、数据库、OBServer、日志事件。
 - OCP 接入配置：支持 OCP 地址、账号密码、Bearer Token、HTTPS 证书校验开关。
 - OCP 同步：测试调用 `/api/v2/info`，集群同步调用 `/api/v2/ob/clusters`。
+- 手工 OB 集群采集：只读连接目标 OB SQL 入口，采集租户、OBServer、参数、租户全备份时间、数据盘/日志盘使用率和上次成功合并信息。
 - OB 日志捕获：解析 `WARN`、`ERROR`、`FATAL`、`OB-xxxx`、`ORA-xxxx`。
+- 服务器日志：Web 只显示采集失败摘要，详细错误写入 `logs/ob-ops-monitor.log`。
 
 ## Oracle 19c PDB 准备
 
 ```sql
-alter session set container = OBPDB;
+alter session set container = gjzqdb;
 
-create user ob_asset identified by "StrongPassword_123";
-grant create session, create table, create sequence, create view to ob_asset;
-grant unlimited tablespace to ob_asset;
+create user gjzqdbsys identified by "现场输入的密码";
+grant create session, create table, create sequence, create view to gjzqdbsys;
+grant unlimited tablespace to gjzqdbsys;
 ```
 
-## 环境变量
+## 配置文件
+
+复制配置模板：
 
 ```bash
-export ORACLE_USER=ob_asset
-export ORACLE_PASSWORD='StrongPassword_123'
-export ORACLE_DSN='10.10.10.20:1521/OBPDB'
-export DEFAULT_OCP_VERSION='4.3.5-20250610160438'
-export DEFAULT_OB_VERSION='4.2.1.8'
+cp config.example.json config.json
+vi config.json
 ```
+
+现场默认配置：
+
+```json
+{
+  "oracle": {
+    "user": "gjzqdbsys",
+    "password": "请在这里填写数据库密码",
+    "dsn": "10.50.40.182:1521/gjzqdb"
+  },
+  "app": {
+    "log_dir": "logs"
+  }
+}
+```
+
+密码包含特殊字符时可以直接写在 JSON 字符串里；如果密码里包含双引号 `"`，需要写成 `\"`；如果包含反斜杠 `\`，需要写成 `\\`。
 
 ## RHEL 7.9 部署
 
@@ -53,6 +71,7 @@ pip install -r requirements.txt
 
 python -c "from app import init_db; init_db(seed=True)"
 gunicorn -w 2 -b 0.0.0.0:8000 app:app
+tail -f logs/ob-ops-monitor.log
 ```
 
 `python-oracledb` 默认使用 Thin 模式，通常不需要安装 Oracle Instant Client。
@@ -73,6 +92,12 @@ gunicorn -w 2 -b 0.0.0.0:8000 app:app
 2. 调用 `GET /api/v2/ob/clusters` 获取 OB 集群。
 3. 将集群写入 Oracle 资产库 `clusters` 表。
 4. 如果 OCP 返回里没有 OB 版本字段，默认写入 `4.2.1.8`。
+
+## 只读原则
+
+- 对 OCP 只发起 `GET` 请求，不修改 OCP。
+- 对 OB 只执行 `SELECT`，不修改 OB。
+- 只向本系统 Oracle 资产库写入资产、配置和采集任务记录。
 
 ## 后续建议
 

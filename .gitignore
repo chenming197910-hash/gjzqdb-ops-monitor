@@ -3,7 +3,9 @@ __pycache__/
 .venv/
 venv/
 .env
+config.json
 *.log
+logs/
 data/
 .pytest_cache/
 .coverage

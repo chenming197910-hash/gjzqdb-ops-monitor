@@ -1,0 +1,18 @@
+{
+  "oracle": {
+    "user": "gjzqdbsys",
+    "password": "请在这里填写数据库密码",
+    "dsn": "10.50.40.182:1521/gjzqdb",
+    "pool": {
+      "min": 1,
+      "max": 5,
+      "increment": 1
+    }
+  },
+  "app": {
+    "port": 8000,
+    "log_dir": "logs",
+    "default_ocp_version": "4.3.5-20250610160438",
+    "default_ob_version": "4.2.1.8"
+  }
+}
