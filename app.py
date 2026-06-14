@@ -2,12 +2,15 @@ import json
 import logging
 import os
 import re
+import zipfile
+from io import BytesIO
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import oracledb
-from flask import Flask, g, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
 from ob_collector import collect_ob_cluster, collect_ob_tenant_detail, probe_ob_cluster, probe_ob_tenant_connection
@@ -60,9 +63,30 @@ DEFAULT_OB_VERSION = os.environ.get("DEFAULT_OB_VERSION", APP_CONFIG.get("defaul
 POOL_MIN = int(os.environ.get("ORACLE_POOL_MIN", POOL_CONFIG.get("min", 1)))
 POOL_MAX = int(os.environ.get("ORACLE_POOL_MAX", POOL_CONFIG.get("max", 5)))
 POOL_INCREMENT = int(os.environ.get("ORACLE_POOL_INCREMENT", POOL_CONFIG.get("increment", 1)))
+SYS_CHECK_INTERVAL_MINUTES = int(os.environ.get("SYS_CHECK_INTERVAL_MINUTES", APP_CONFIG.get("sys_check_interval_minutes", 60)))
 
 pool = None
 schema_initialized = False
+
+XLSX_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"""
+XLSX_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+XLSX_WORKBOOK = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="租户信息" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"""
+XLSX_WORKBOOK_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"""
 
 
 def setup_logging():
@@ -152,7 +176,6 @@ def create_app():
     def open_db():
         if request.path.startswith("/api/"):
             g.db = get_pool().acquire()
-            ensure_schema(g.db)
 
     @app.teardown_request
     def close_db(_exc):
@@ -187,6 +210,18 @@ def create_app():
                 "observers": scalar(db, "select count(*) from ob_servers"),
                 "log_errors": scalar(db, "select count(*) from ob_log_events where severity in ('ERROR', 'FATAL')"),
                 "ocp_connections": safe_scalar(db, "select count(*) from ocp_connections"),
+                "sys_unhealthy": safe_scalar(
+                    db,
+                    """
+                    select count(*)
+                    from (
+                        select cluster_id, status,
+                               row_number() over (partition by cluster_id order by checked_at desc, id desc) as rn
+                        from sys_tenant_checks
+                    )
+                    where rn = 1 and status <> 'success'
+                    """,
+                ),
             }
         )
 
@@ -197,6 +232,9 @@ def create_app():
             missing = [key for key in ["name", "endpoint", "sys_user"] if not payload.get(key)]
             if missing:
                 return jsonify({"error": "missing fields", "fields": missing}), 400
+            existing = one(g.db, "select id from clusters where name = :name", {"name": payload["name"]})
+            if existing:
+                return jsonify({"error": "cluster exists", "message": "集群名称已存在，请使用新名称，避免覆盖老集群"}), 409
             new_id = upsert_cluster(g.db, payload)
             g.db.commit()
             return jsonify({"id": new_id}), 201
@@ -209,14 +247,19 @@ def create_app():
                        c.sys_user,
                        case when c.sys_password is null then 0 else 1 end as has_password,
                        c.version, c.status, c.owner, c.remark,
+                       nvl(s.enabled, 0) as schedule_enabled,
+                       s.run_time as schedule_run_time,
+                       s.last_run_at as schedule_last_run_at,
                        c.created_at, c.updated_at,
                        count(distinct t.id) as tenant_count,
                        count(distinct o.id) as observer_count
                 from clusters c
                 left join tenants t on t.cluster_id = c.id
                 left join ob_servers o on o.cluster_id = c.id
+                left join cluster_collect_schedules s on s.cluster_id = c.id
                 group by c.id, c.name, c.environment, c.region, c.endpoint, c.port,
                          c.sys_user, c.sys_password, c.version, c.status, c.owner, c.remark,
+                         s.enabled, s.run_time, s.last_run_at,
                          c.created_at, c.updated_at
                 order by c.environment, c.name
                 """,
@@ -249,6 +292,7 @@ def create_app():
                     g.db,
                     """
                     select id, name, tenant_mode, primary_zone, locality, tenant_role,
+                           zone_resource_summary,
                            unit_num, cpu_cores, memory_gb, last_full_backup_time,
                            data_disk_used_gb, data_disk_total_gb, data_disk_usage_pct,
                            log_disk_used_gb, log_disk_total_gb, log_disk_usage_pct,
@@ -300,24 +344,22 @@ def create_app():
 
     @app.route("/api/tenants")
     def tenants():
-        return jsonify(
-            all_rows(
-                g.db,
-                """
-                select t.id, t.cluster_id, c.name as cluster_name, t.name, t.tenant_mode,
-                       t.primary_zone, t.locality, t.tenant_role, t.unit_num,
-                       t.cpu_cores, t.memory_gb,
-                       t.last_full_backup_time,
-                       t.data_disk_used_gb, t.data_disk_total_gb, t.data_disk_usage_pct,
-                       t.log_disk_used_gb, t.log_disk_total_gb, t.log_disk_usage_pct,
-                       t.last_success_merge_time, t.last_merge_status,
-                       t.status,
-                       t.created_at, t.updated_at
-                from tenants t
-                left join clusters c on c.id = t.cluster_id
-                order by c.name, t.name
-                """,
-            )
+        return jsonify(list_tenants(g.db))
+
+    @app.route("/api/tenants/export.xlsx")
+    def export_tenants():
+        rows = filter_tenant_export_rows(
+            list_tenants(g.db),
+            request.args.get("cluster_id", ""),
+            request.args.get("hide_standby", "1") == "1",
+            request.args.get("hide_meta", "1") == "1",
+        )
+        workbook = build_tenants_xlsx(rows)
+        filename = f"ob-tenants-{local_now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+        return Response(
+            workbook,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
     @app.route("/api/tenants/<int:tenant_id>")
@@ -430,13 +472,17 @@ def create_app():
             "endpoint": tenant["endpoint"],
             "port": tenant["port"],
             "tenant_name": tenant["name"],
-            "tenant_user": build_tenant_login_user(payload.get("tenant_user") or connection.get("tenant_user"), tenant),
+            "cluster_name": tenant["cluster_name"],
+            "tenant_mode": tenant["tenant_mode"],
+            "tenant_user": build_tenant_collect_user(payload.get("tenant_user") or connection.get("tenant_user"), tenant),
             "tenant_password": payload.get("tenant_password") or connection.get("tenant_password"),
-            "database": payload.get("database_name") or connection.get("database_name") or "",
+            "database": build_tenant_service_name(payload.get("database_name") or connection.get("database_name"), tenant),
         }
+        started = local_now()
         try:
             result = probe_ob_tenant_connection(config)
         except Exception as exc:
+            message = str(exc)[:1000]
             log_event(
                 logging.ERROR,
                 "tenant_connection_test_failed",
@@ -444,10 +490,15 @@ def create_app():
                 tenant_name=tenant["name"],
                 target=f"{tenant['endpoint']}:{tenant['port']}",
                 user=config.get("tenant_user"),
-                error=str(exc),
+                service_name=config.get("database"),
+                error=message,
                 exc_info=True,
             )
-            return jsonify({"error": "tenant test failed", "message": generic_log_message("租户连接测试")}), 400
+            record_collection_job(g.db, tenant["cluster_id"], "tenant_probe", "failed", message, started)
+            g.db.commit()
+            return jsonify({"error": "tenant test failed", "message": message}), 400
+        record_collection_job(g.db, tenant["cluster_id"], "tenant_probe", "success", result.get("message", ""), started)
+        g.db.commit()
         return jsonify(result)
 
     @app.route("/api/tenants/<int:tenant_id>/schedule", methods=["POST"])
@@ -521,9 +572,11 @@ def create_app():
                     "endpoint": tenant["endpoint"],
                     "port": tenant["port"],
                     "tenant_name": tenant["name"],
-                    "tenant_user": build_tenant_login_user(connection["tenant_user"], tenant),
+                    "cluster_name": tenant["cluster_name"],
+                    "tenant_mode": tenant["tenant_mode"],
+                    "tenant_user": build_tenant_collect_user(connection["tenant_user"], tenant),
                     "tenant_password": connection["tenant_password"],
-                    "database": connection.get("database_name") or "",
+                    "database": build_tenant_service_name(connection.get("database_name"), tenant),
                 }
             )
         except Exception as exc:
@@ -533,16 +586,18 @@ def create_app():
                 tenant_id=tenant_id,
                 tenant_name=tenant["name"],
                 target=f"{tenant['endpoint']}:{tenant['port']}",
-                user=connection["tenant_user"],
-                error=str(exc),
+                user=build_tenant_collect_user(connection["tenant_user"], tenant),
+                service_name=connection.get("database_name") or tenant["name"],
+                error=str(exc)[:1000],
                 exc_info=True,
             )
-            message = generic_log_message("租户详情只读采集")
+            message = str(exc)[:1000]
             record_collection_job(g.db, tenant["cluster_id"], "tenant_detail", "failed", message, started)
             g.db.commit()
             return jsonify({"error": "tenant collect failed", "message": message}), 502
         stats = store_tenant_detail(g.db, tenant_id, collected)
-        record_collection_job(g.db, tenant["cluster_id"], "tenant_detail", "success", json.dumps(stats, ensure_ascii=False), started)
+        status = "warning" if stats.get("warnings") else "success"
+        record_collection_job(g.db, tenant["cluster_id"], "tenant_detail", status, json.dumps(stats, ensure_ascii=False), started)
         g.db.commit()
         return jsonify(stats)
 
@@ -642,6 +697,19 @@ def create_app():
             )
         )
 
+    @app.route("/api/sys-tenant-checks")
+    def sys_tenant_checks():
+        try:
+            return jsonify(latest_sys_tenant_checks(g.db))
+        except oracledb.DatabaseError:
+            return jsonify([])
+
+    @app.route("/api/sys-tenant-checks/run", methods=["POST"])
+    def run_sys_tenant_checks_now():
+        stats = run_sys_tenant_checks(g.db, force=True)
+        g.db.commit()
+        return jsonify(stats)
+
     @app.route("/api/ocp/connections", methods=["GET", "POST"])
     def ocp_connections():
         if request.method == "POST":
@@ -687,16 +755,37 @@ def create_app():
         g.db.commit()
         return jsonify({"deleted": True, "id": connection_id})
 
+    @app.route("/api/clusters/<int:cluster_id>/schedule", methods=["POST"])
+    def save_cluster_schedule(cluster_id):
+        cluster = one(g.db, "select id from clusters where id = :id", {"id": cluster_id})
+        if not cluster:
+            return jsonify({"error": "cluster not found"}), 404
+        payload = request.get_json(force=True)
+        upsert_cluster_schedule(g.db, cluster_id, payload)
+        g.db.commit()
+        return jsonify({"saved": True, "cluster_id": cluster_id})
+
     @app.route("/api/ocp/connections/<int:connection_id>/sync", methods=["POST"])
     def ocp_sync(connection_id):
         config = get_ocp_config(g.db, connection_id)
         if not config:
             return jsonify({"error": "OCP connection not found"}), 404
+        payload = request.get_json(force=True) if request.data else {}
+        confirm_duplicate_databases = bool(payload.get("confirm_duplicate_databases"))
         started = local_now()
         client = OcpClient(config)
         raw_clusters = client.fetch_clusters()
         clusters = normalize_ocp_clusters(raw_clusters)
-        stats = {"clusters": 0, "observers": 0, "tenants": 0, "databases": 0, "warnings": []}
+        stats = {
+            "clusters": 0,
+            "observers": 0,
+            "tenants": 0,
+            "databases": 0,
+            "duplicate_databases": 0,
+            "duplicate_database_examples": [],
+            "duplicate_confirmation_required": False,
+            "warnings": [],
+        }
         for cluster in clusters:
             cluster_id = upsert_cluster(g.db, cluster)
             stats["clusters"] += 1
@@ -719,8 +808,22 @@ def create_app():
                     tenant_id = tenant_id_by_name.get(database["tenant_name"])
                 if tenant_id:
                     database["tenant_id"] = tenant_id
+                    existing_database = find_database(g.db, tenant_id, database["name"])
+                    if existing_database and not confirm_duplicate_databases:
+                        stats["duplicate_databases"] += 1
+                        stats["duplicate_confirmation_required"] = True
+                        if len(stats["duplicate_database_examples"]) < 20:
+                            stats["duplicate_database_examples"].append(
+                                {
+                                    "cluster": cluster["name"],
+                                    "tenant": database.get("tenant_name") or "",
+                                    "database": database["name"],
+                                }
+                            )
+                        continue
                     upsert_database(g.db, database)
                     stats["databases"] += 1
+        run_status = "warning" if stats["duplicate_confirmation_required"] else "success"
         run_id = insert_returning_id(
             g.db,
             """
@@ -732,7 +835,7 @@ def create_app():
             """,
             {
                 "connection_id": connection_id,
-                "status": "success",
+                "status": run_status,
                 "cluster_count": len(clusters),
                 "message": json.dumps(stats, ensure_ascii=False)[:1000],
                 "started_at": started.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1019,17 +1122,24 @@ def upsert_cluster(db, payload):
 def delete_cluster_local(db, cluster_id):
     tenant_ids = [row["id"] for row in all_rows(db, "select id from tenants where cluster_id = :id", {"id": cluster_id})]
     for tenant_id in tenant_ids:
-        execute(db, "delete from databases where tenant_id = :id", {"id": tenant_id})
-        execute(db, "delete from tenant_collect_schedules where tenant_id = :id", {"id": tenant_id})
-        execute(db, "delete from tenant_runtime_metrics where tenant_id = :id", {"id": tenant_id})
-        execute(db, "delete from tenant_top_objects where tenant_id = :id", {"id": tenant_id})
-        execute(db, "delete from tenant_connections where tenant_id = :id", {"id": tenant_id})
+        delete_tenant_local(db, tenant_id)
     execute(db, "delete from ob_parameters where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from ob_log_events where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from collection_jobs where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from cluster_collect_schedules where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from ob_servers where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from tenants where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from clusters where id = :id", {"id": cluster_id})
+
+
+def delete_tenant_local(db, tenant_id):
+    execute(db, "delete from databases where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenant_collect_schedules where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenant_runtime_metrics where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenant_top_objects where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenant_connections where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from ob_parameters where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenants where id = :id", {"id": tenant_id})
 
 
 def record_collection_job(db, cluster_id, target_type, status, message, started):
@@ -1057,7 +1167,7 @@ def get_tenant_with_cluster(db, tenant_id):
         """
         select t.id, t.cluster_id, c.name as cluster_name, c.endpoint, c.port,
                t.name, t.tenant_mode, t.primary_zone, t.locality, t.tenant_role,
-               t.unit_num, t.cpu_cores, t.memory_gb, t.last_full_backup_time,
+               t.zone_resource_summary, t.unit_num, t.cpu_cores, t.memory_gb, t.last_full_backup_time,
                t.data_disk_used_gb, t.data_disk_total_gb, t.data_disk_usage_pct,
                t.log_disk_used_gb, t.log_disk_total_gb, t.log_disk_usage_pct,
                t.last_success_merge_time, t.last_merge_status, t.status
@@ -1118,6 +1228,25 @@ def build_tenant_login_user(base_user, tenant):
     return f"{user}@{tenant['name']}#{tenant['cluster_name']}"
 
 
+def is_oracle_mode_tenant(tenant):
+    return str(tenant.get("tenant_mode") or "").upper() == "ORACLE"
+
+
+def build_tenant_collect_user(base_user, tenant):
+    user = normalize_base_tenant_user(base_user)
+    if not user:
+        return ""
+    return build_tenant_login_user(user, tenant)
+
+
+def build_tenant_service_name(value, tenant):
+    if value:
+        return value
+    if is_oracle_mode_tenant(tenant):
+        return tenant["name"]
+    return ""
+
+
 def upsert_tenant_schedule(db, tenant_id, payload):
     existing = one(db, "select id from tenant_collect_schedules where tenant_id = :tenant_id", {"tenant_id": tenant_id})
     data = {
@@ -1148,6 +1277,240 @@ def upsert_tenant_schedule(db, tenant_id, payload):
         (tenant_id, enabled, frequency, run_time, day_of_week, day_of_month, created_at, updated_at)
         values (:tenant_id, :enabled, :frequency, :run_time, :day_of_week, :day_of_month,
                 systimestamp, systimestamp)
+        returning id into :id
+        """,
+        data,
+    )
+
+
+def list_tenants(db):
+    return all_rows(
+        db,
+        """
+        select t.id, t.cluster_id, c.name as cluster_name, t.name, t.tenant_mode,
+               t.primary_zone, t.locality, t.tenant_role, t.zone_resource_summary, t.unit_num,
+               t.cpu_cores, t.memory_gb,
+               t.last_full_backup_time,
+               t.data_disk_used_gb, t.data_disk_total_gb, t.data_disk_usage_pct,
+               t.log_disk_used_gb, t.log_disk_total_gb, t.log_disk_usage_pct,
+               t.last_success_merge_time, t.last_merge_status,
+               t.status,
+               t.created_at, t.updated_at
+        from tenants t
+        left join clusters c on c.id = t.cluster_id
+        order by c.name, t.name
+        """,
+    )
+
+
+def filter_tenant_export_rows(rows, cluster_id, hide_standby, hide_meta):
+    filtered = []
+    for row in rows:
+        if cluster_id and str(row.get("cluster_id")) != str(cluster_id):
+            continue
+        if hide_standby and is_standby_tenant_row(row):
+            continue
+        if hide_meta and is_meta_tenant_row(row):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def is_standby_tenant_row(row):
+    values = [row.get("tenant_role"), row.get("status"), row.get("name")]
+    return any("standby" in str(value or "").lower() for value in values)
+
+
+def is_meta_tenant_row(row):
+    name = str(row.get("name") or "")
+    return name.lower().startswith("meta$")
+
+
+def build_tenants_xlsx(rows):
+    headers = [
+        ("cluster_name", "集群"),
+        ("name", "租户"),
+        ("tenant_mode", "模式"),
+        ("primary_zone", "Primary Zone"),
+        ("tenant_role", "主备角色"),
+        ("unit_num", "Unit数"),
+        ("cpu_cores", "CPU"),
+        ("memory_gb", "内存GB"),
+        ("last_full_backup_time", "上次全备份"),
+        ("data_disk_used_gb", "数据盘已用GB"),
+        ("data_disk_total_gb", "数据盘总GB"),
+        ("data_disk_usage_pct", "数据盘使用率%"),
+        ("log_disk_used_gb", "日志盘已用GB"),
+        ("log_disk_total_gb", "日志盘总GB"),
+        ("log_disk_usage_pct", "日志盘使用率%"),
+        ("last_success_merge_time", "上次成功合并"),
+        ("last_merge_status", "合并状态"),
+        ("status", "状态"),
+        ("locality", "Locality"),
+        ("zone_resource_summary", "Zone资源"),
+        ("updated_at", "更新时间"),
+    ]
+    data = [[label for _key, label in headers]]
+    for row in rows:
+        data.append([row.get(key, "") for key, _label in headers])
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", XLSX_CONTENT_TYPES)
+        zf.writestr("_rels/.rels", XLSX_RELS)
+        zf.writestr("xl/workbook.xml", XLSX_WORKBOOK)
+        zf.writestr("xl/_rels/workbook.xml.rels", XLSX_WORKBOOK_RELS)
+        zf.writestr("xl/worksheets/sheet1.xml", build_sheet_xml(data))
+    return output.getvalue()
+
+
+def build_sheet_xml(rows):
+    sheet_rows = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for col_index, value in enumerate(row, start=1):
+            ref = f"{column_name(col_index)}{row_index}"
+            text = escape("" if value is None else str(value))
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+        sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>'
+        f'{"".join(sheet_rows)}'
+        '</sheetData>'
+        '</worksheet>'
+    )
+
+
+def column_name(index):
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def latest_sys_tenant_checks(db):
+    return all_rows(
+        db,
+        """
+        select c.id as cluster_id, c.name as cluster_name, c.endpoint, c.port, c.sys_user,
+               case when c.sys_password is null then 0 else 1 end as has_password,
+               x.status, x.message, x.checked_at
+        from clusters c
+        left join (
+            select cluster_id, status, message, checked_at
+            from (
+                select cluster_id, status, message, checked_at,
+                       row_number() over (partition by cluster_id order by checked_at desc, id desc) as rn
+                from sys_tenant_checks
+            )
+            where rn = 1
+        ) x on x.cluster_id = c.id
+        order by case when x.status = 'success' then 1 else 0 end, c.name
+        """,
+    )
+
+
+def run_sys_tenant_checks(db, force=False):
+    stats = {"checked": 0, "success": 0, "failed": 0, "skipped": 0}
+    clusters = all_rows(
+        db,
+        """
+        select c.id, c.name, c.endpoint, c.port, c.sys_user, c.sys_password,
+               x.checked_at as last_checked_at
+        from clusters c
+        left join (
+            select cluster_id, checked_at
+            from (
+                select cluster_id, checked_at,
+                       row_number() over (partition by cluster_id order by checked_at desc, id desc) as rn
+                from sys_tenant_checks
+            )
+            where rn = 1
+        ) x on x.cluster_id = c.id
+        order by c.name
+        """,
+    )
+    for cluster in clusters:
+        if not force and not sys_check_due(cluster.get("last_checked_at")):
+            stats["skipped"] += 1
+            continue
+        if not cluster.get("sys_password"):
+            record_sys_tenant_check(db, cluster["id"], "failed", "未配置 sys 租户采集密码")
+            stats["checked"] += 1
+            stats["failed"] += 1
+            continue
+        try:
+            result = probe_ob_cluster(cluster)
+            record_sys_tenant_check(db, cluster["id"], "success", result.get("message", "sys 租户连接正常"))
+            stats["success"] += 1
+        except Exception as exc:
+            message = str(exc)[:1000]
+            record_sys_tenant_check(db, cluster["id"], "failed", message)
+            log_event(
+                logging.ERROR,
+                "sys_tenant_check_failed",
+                cluster_id=cluster["id"],
+                cluster_name=cluster["name"],
+                target=f"{cluster.get('endpoint')}:{cluster.get('port')}",
+                user=cluster.get("sys_user"),
+                error=message,
+                exc_info=True,
+            )
+            stats["failed"] += 1
+        stats["checked"] += 1
+    return stats
+
+
+def sys_check_due(last_checked_at):
+    if not last_checked_at:
+        return True
+    if isinstance(last_checked_at, str):
+        try:
+            last_checked_at = datetime.strptime(last_checked_at[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return True
+    elapsed = local_now() - last_checked_at
+    return elapsed.total_seconds() >= SYS_CHECK_INTERVAL_MINUTES * 60
+
+
+def record_sys_tenant_check(db, cluster_id, status, message):
+    execute(
+        db,
+        """
+        insert into sys_tenant_checks
+        (cluster_id, status, message, checked_at)
+        values (:cluster_id, :status, :message, systimestamp)
+        """,
+        {"cluster_id": cluster_id, "status": status, "message": str(message or "")[:1000]},
+    )
+
+
+def upsert_cluster_schedule(db, cluster_id, payload):
+    existing = one(db, "select id from cluster_collect_schedules where cluster_id = :cluster_id", {"cluster_id": cluster_id})
+    data = {
+        "cluster_id": cluster_id,
+        "enabled": 1 if payload.get("enabled", True) else 0,
+        "run_time": payload.get("run_time", "07:00"),
+    }
+    if existing:
+        execute(
+            db,
+            """
+            update cluster_collect_schedules
+            set enabled = :enabled, run_time = :run_time, updated_at = systimestamp
+            where cluster_id = :cluster_id
+            """,
+            data,
+        )
+        return existing["id"]
+    return insert_returning_id(
+        db,
+        """
+        insert into cluster_collect_schedules
+        (cluster_id, enabled, run_time, created_at, updated_at)
+        values (:cluster_id, :enabled, :run_time, systimestamp, systimestamp)
         returning id into :id
         """,
         data,
@@ -1189,6 +1552,8 @@ def store_tenant_detail(db, tenant_id, collected):
         if metric.get("_error"):
             stats["warnings"].append(f"运行指标采集失败: {metric['_error'][:300]}")
             continue
+        current_processes = to_number(metric.get("current_processes"))
+        max_processes = to_number(metric.get("max_processes"))
         insert_returning_id(
             db,
             """
@@ -1200,8 +1565,8 @@ def store_tenant_detail(db, tenant_id, collected):
             """,
             {
                 "tenant_id": tenant_id,
-                "current_processes": int(metric.get("current_processes") or 0),
-                "max_processes": int(metric.get("max_processes") or 0),
+                "current_processes": int(current_processes or 0),
+                "max_processes": int(max_processes) if max_processes is not None else None,
                 "collected_at": collected_at,
             },
         )
@@ -1217,6 +1582,7 @@ def collect_cluster_assets(db, cluster_id, collected):
         "tenant_backups": 0,
         "tenant_disk_usage": 0,
         "tenant_resources": 0,
+        "tenant_zone_resources": 0,
         "tenant_merges": 0,
         "parameters": 0,
         "warnings": [],
@@ -1243,14 +1609,18 @@ def collect_cluster_assets(db, cluster_id, collected):
         stats["servers"] += 1
 
     tenant_id_by_source = {}
+    collected_tenant_names = set()
+    tenant_collect_failed = False
     backup_by_tenant = index_collected_rows(collected.get("tenant_backups", []), "tenant_id", "租户全备份", stats)
     disk_by_tenant = index_collected_rows(collected.get("tenant_disk_usage", []), "tenant_id", "租户磁盘", stats)
     resource_by_tenant = index_collected_rows(collected.get("tenant_resources", []), "tenant_id", "租户资源规格", stats)
+    zone_resources_by_tenant = group_zone_resources(collected.get("tenant_zone_resources", []), stats)
     merge_by_tenant = index_collected_rows(collected.get("tenant_merges", []), "tenant_id", "租户合并", stats)
 
     for tenant in collected.get("tenants", []):
         if tenant.get("_error"):
             stats["warnings"].append(f"租户采集失败: {tenant['_error'][:300]}")
+            tenant_collect_failed = True
             continue
         source_tenant_id = str(tenant.get("tenant_id") or "")
         backup = backup_by_tenant.get(source_tenant_id, {})
@@ -1264,7 +1634,8 @@ def collect_cluster_assets(db, cluster_id, collected):
             "primary_zone": tenant.get("primary_zone") or "",
             "locality": tenant.get("locality") or "",
             "tenant_role": tenant.get("tenant_role") or tenant.get("role") or "",
-            "unit_num": int(tenant.get("unit_num") or 0),
+            "zone_resource_summary": zone_resources_by_tenant.get(source_tenant_id) or "",
+            "unit_num": int(to_number(tenant.get("unit_num")) or to_number(resource.get("unit_num")) or 0),
             "cpu_cores": to_number(resource.get("cpu_cores")),
             "memory_gb": to_number(resource.get("memory_gb")),
             "last_full_backup_time": backup.get("last_full_backup_time"),
@@ -1280,6 +1651,7 @@ def collect_cluster_assets(db, cluster_id, collected):
         }
         if not payload["name"]:
             continue
+        collected_tenant_names.add(payload["name"])
         tenant_id = upsert_tenant(db, payload)
         tenant_id_by_source[source_tenant_id or payload["name"]] = tenant_id
         stats["tenants"] += 1
@@ -1289,9 +1661,16 @@ def collect_cluster_assets(db, cluster_id, collected):
             stats["tenant_disk_usage"] += 1
         if resource:
             stats["tenant_resources"] += 1
+        if zone_resources_by_tenant.get(source_tenant_id):
+            stats["tenant_zone_resources"] += 1
         if merge:
             stats["tenant_merges"] += 1
+    if not tenant_collect_failed and not collected_tenant_names:
+        stats["warnings"].append("本次未采集到任何租户，已保留该集群现有租户，避免误删")
 
+    parameter_collect_failed = any(param.get("_error") for param in collected.get("parameters", []))
+    if not parameter_collect_failed:
+        execute(db, "delete from ob_parameters where cluster_id = :cluster_id", {"cluster_id": cluster_id})
     for param in collected.get("parameters", []):
         if param.get("_error"):
             stats["warnings"].append(f"参数采集失败: {param['_error'][:300]}")
@@ -1323,6 +1702,22 @@ def index_collected_rows(rows, key, label, stats):
         if row_key not in (None, ""):
             indexed[str(row_key)] = row
     return indexed
+
+
+def group_zone_resources(rows, stats):
+    grouped = {}
+    for row in rows:
+        if row.get("_error"):
+            stats["warnings"].append(f"租户Zone资源采集失败: {row['_error'][:300]}")
+            continue
+        tenant_id = row.get("tenant_id")
+        zone = row.get("zone")
+        if tenant_id in (None, "") or not zone:
+            continue
+        cpu = to_number(row.get("cpu_cores")) or 0
+        memory = to_number(row.get("memory_gb")) or 0
+        grouped.setdefault(str(tenant_id), []).append(f"{zone}: {cpu:g}C/{memory:g}GB")
+    return {tenant_id: "; ".join(values) for tenant_id, values in grouped.items()}
 
 
 def to_number(value):
@@ -1463,6 +1858,7 @@ def upsert_tenant(db, payload):
         "primary_zone": "",
         "locality": "",
         "tenant_role": "",
+        "zone_resource_summary": "",
         "unit_num": 0,
         "cpu_cores": None,
         "memory_gb": None,
@@ -1490,6 +1886,7 @@ def upsert_tenant(db, payload):
             update tenants
             set tenant_mode = :tenant_mode, primary_zone = :primary_zone,
                 locality = :locality, tenant_role = :tenant_role,
+                zone_resource_summary = :zone_resource_summary,
                 unit_num = :unit_num,
                 cpu_cores = :cpu_cores,
                 memory_gb = :memory_gb,
@@ -1513,13 +1910,13 @@ def upsert_tenant(db, payload):
         """
         insert into tenants
         (cluster_id, name, tenant_mode, primary_zone, locality, tenant_role,
-         unit_num, cpu_cores, memory_gb, last_full_backup_time,
+         zone_resource_summary, unit_num, cpu_cores, memory_gb, last_full_backup_time,
          data_disk_used_gb, data_disk_total_gb, data_disk_usage_pct,
          log_disk_used_gb, log_disk_total_gb, log_disk_usage_pct,
          last_success_merge_time, last_merge_status,
          status, created_at, updated_at)
         values (:cluster_id, :name, :tenant_mode, :primary_zone, :locality, :tenant_role,
-                :unit_num, :cpu_cores, :memory_gb, :last_full_backup_time,
+                :zone_resource_summary, :unit_num, :cpu_cores, :memory_gb, :last_full_backup_time,
                 :data_disk_used_gb, :data_disk_total_gb, :data_disk_usage_pct,
                 :log_disk_used_gb, :log_disk_total_gb, :log_disk_usage_pct,
                 :last_success_merge_time, :last_merge_status,
@@ -1597,6 +1994,14 @@ def upsert_database(db, payload):
         returning id into :id
         """,
         payload,
+    )
+
+
+def find_database(db, tenant_id, name):
+    return one(
+        db,
+        "select id, tenant_id, name from databases where tenant_id = :tenant_id and name = :name",
+        {"tenant_id": tenant_id, "name": name},
     )
 
 
@@ -1686,8 +2091,10 @@ def execute_ddl(conn, ddl):
         execute(conn, ddl)
     except oracledb.DatabaseError as exc:
         error = exc.args[0]
-        if getattr(error, "code", None) not in (955, 1430):
+        code = getattr(error, "code", None)
+        if code not in (955, 1430):
             raise
+    return True
 
 
 DDL = [
@@ -1752,6 +2159,7 @@ DDL = [
         primary_zone varchar2(256),
         locality varchar2(1000),
         tenant_role varchar2(64),
+        zone_resource_summary varchar2(1000),
         unit_num number,
         cpu_cores number,
         memory_gb number,
@@ -1899,6 +2307,26 @@ DDL = [
     )
     """,
     """
+    create table cluster_collect_schedules (
+        id number generated by default on null as identity primary key,
+        cluster_id number not null references clusters(id),
+        enabled number(1) default 1 not null,
+        run_time varchar2(8) default '07:00' not null,
+        last_run_at timestamp,
+        created_at timestamp not null,
+        updated_at timestamp not null
+    )
+    """,
+    """
+    create table sys_tenant_checks (
+        id number generated by default on null as identity primary key,
+        cluster_id number not null references clusters(id),
+        status varchar2(32) not null,
+        message varchar2(1000),
+        checked_at timestamp not null
+    )
+    """,
+    """
     alter table clusters add sys_password varchar2(512)
     """,
     """
@@ -1906,6 +2334,9 @@ DDL = [
     """,
     """
     alter table tenants add tenant_role varchar2(64)
+    """,
+    """
+    alter table tenants add zone_resource_summary varchar2(1000)
     """,
     """
     alter table tenants add cpu_cores number

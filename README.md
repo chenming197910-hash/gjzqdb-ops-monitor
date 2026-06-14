@@ -12,11 +12,13 @@
 ## 已实现功能
 
 - 首页运维全景：物理机、虚拟机、故障主机、报警主机、正常主机。
+- Sys 租户健康：集中展示所有集群 sys 租户最近一次连接检查结果，默认每 60 分钟自动检查一次。
 - OB 集群看板：容量、CPU、内存、租户、数据库、OBServer 摘要。
 - Oracle 资产库：保存集群、服务器、租户、数据库、OBServer、日志事件。
 - OCP 接入配置：支持 OCP 地址、账号密码、Bearer Token、HTTPS 证书校验开关。
 - OCP 同步：测试调用 `/api/v2/info`，集群同步调用 `/api/v2/ob/clusters`。
 - 手工 OB 集群采集：只读连接目标 OB SQL 入口，采集租户、OBServer、参数、租户全备份时间、数据盘/日志盘使用率和上次成功合并信息。
+- Oracle 模式租户详情采集：默认调用 `obclient` 连接 OB Oracle 租户，用户名按 `用户@租户#集群` 拼接。
 - OB 日志捕获：解析 `WARN`、`ERROR`、`FATAL`、`OB-xxxx`、`ORA-xxxx`。
 - 服务器日志：Web 只显示采集失败摘要，详细错误写入 `logs/ob-ops-monitor.log`。
 

@@ -12,6 +12,7 @@
   "app": {
     "port": 8000,
     "log_dir": "logs",
+    "sys_check_interval_minutes": 60,
     "default_ocp_version": "4.3.5-20250610160438",
     "default_ob_version": "4.2.1.8"
   }

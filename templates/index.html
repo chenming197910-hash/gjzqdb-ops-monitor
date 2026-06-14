@@ -30,6 +30,33 @@
 
     <section class="metrics" id="summaryCards"></section>
 
+    <section class="section" id="sysHealthSection">
+      <div class="section-head">
+        <div>
+          <h2>Sys 租户健康</h2>
+          <p>展示所有 OB 集群 sys 租户最近一次连接检查结果。</p>
+        </div>
+        <div class="actions">
+          <button id="checkSysNow">立即检查</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>集群</th>
+              <th>连接地址</th>
+              <th>系统用户</th>
+              <th>状态</th>
+              <th>检查时间</th>
+              <th>信息</th>
+            </tr>
+          </thead>
+          <tbody id="sysHealthRows"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="section resource-section" id="tenantResourceSection">
       <div class="section-head">
         <div>
@@ -77,6 +104,7 @@
               <th>租户</th>
               <th>OBServer</th>
               <th>状态</th>
+              <th>每日采集</th>
               <th>负责人</th>
               <th>操作</th>
             </tr>
@@ -93,8 +121,14 @@
           <p>从 OB 只读采集租户模式、Primary Zone、Locality、主备角色、备份、磁盘和合并信息。</p>
         </div>
         <div class="tenant-filters">
+          <label>集群
+            <select id="tenantClusterFilter">
+              <option value="">全部集群</option>
+            </select>
+          </label>
           <label><input id="hideStandbyTenants" type="checkbox" checked> 屏蔽 standby 租户 <span id="hideStandbyState" class="filter-state"></span></label>
           <label><input id="hideMetaTenants" type="checkbox" checked> 屏蔽 meta 租户 <span id="hideMetaState" class="filter-state"></span></label>
+          <button id="exportTenants" type="button">导出Excel</button>
         </div>
       </div>
       <div class="table-wrap">
@@ -107,10 +141,7 @@
               <th>模式</th>
               <th>Primary Zone</th>
               <th>主备角色</th>
-              <th>主备状态</th>
               <th>Unit数</th>
-              <th>CPU</th>
-              <th>内存GB</th>
               <th>上次全备份</th>
               <th>数据盘</th>
               <th>日志盘</th>
@@ -273,6 +304,22 @@
       </div>
       <p class="form-note">只读采集只会连接 OB 执行 SELECT，不会对 OB 做任何修改。</p>
       <div class="modal-actions"><button type="submit" class="primary">保存采集配置</button></div>
+    </form>
+  </div>
+
+  <div class="modal" id="clusterScheduleModal">
+    <form id="clusterScheduleForm" class="modal-panel">
+      <div class="modal-head">
+        <h2>配置集群每日采集</h2>
+        <button type="button" class="icon-button" data-close="clusterScheduleModal">×</button>
+      </div>
+      <input name="cluster_id" type="hidden">
+      <div class="form-grid">
+        <label class="check"><input name="enabled" type="checkbox" checked> 启用每日采集</label>
+        <label>每天采集时间<input name="run_time" type="time" value="07:00"></label>
+      </div>
+      <p class="form-note">定时采集会按每天指定时间执行集群只读采集；手工“只读采集”按钮仍可随时使用。</p>
+      <div class="modal-actions"><button type="submit" class="primary">保存计划</button></div>
     </form>
   </div>
 

@@ -1,4 +1,7 @@
+import os
 import re
+import subprocess
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -21,6 +24,7 @@ def collect_ob_cluster(cluster):
             "tenant_backups": query_first(conn, TENANT_BACKUP_QUERIES),
             "tenant_disk_usage": query_first(conn, TENANT_DISK_USAGE_QUERIES),
             "tenant_resources": query_first(conn, TENANT_RESOURCE_QUERIES),
+            "tenant_zone_resources": query_first(conn, TENANT_ZONE_RESOURCE_QUERIES),
             "tenant_merges": query_first(conn, TENANT_MERGE_QUERIES),
             "parameters": query_first(conn, PARAMETER_QUERIES),
         }
@@ -29,28 +33,60 @@ def collect_ob_cluster(cluster):
 
 
 def collect_ob_tenant_detail(config):
-    pymysql = load_pymysql()
-    conn = open_tenant_connection(pymysql, config)
-    try:
-        return {
-            "readonly": True,
-            "top_objects": query_first(conn, TENANT_TOP_OBJECT_QUERIES),
-            "runtime_metrics": query_first(conn, TENANT_RUNTIME_QUERIES),
-        }
-    finally:
-        conn.close()
+    if is_oracle_tenant(config):
+        if oracle_tenant_driver(config) == "obclient":
+            return {
+                "readonly": True,
+                "top_objects": obclient_query_first(config, ORACLE_TENANT_TOP_OBJECT_QUERIES),
+                "runtime_metrics": obclient_query_first(config, ORACLE_TENANT_RUNTIME_QUERIES),
+            }
+        conn = open_oracle_tenant_connection(config)
+        try:
+            return {
+                "readonly": True,
+                "top_objects": query_first(conn, ORACLE_TENANT_TOP_OBJECT_QUERIES),
+                "runtime_metrics": query_first(conn, ORACLE_TENANT_RUNTIME_QUERIES),
+            }
+        finally:
+            conn.close()
+    else:
+        pymysql = load_pymysql()
+        conn = open_tenant_connection(pymysql, config)
+        queries = TENANT_TOP_OBJECT_QUERIES
+        runtime_queries = TENANT_RUNTIME_QUERIES
+        try:
+            return {
+                "readonly": True,
+                "top_objects": query_first(conn, queries),
+                "runtime_metrics": query_first(conn, runtime_queries),
+            }
+        finally:
+            conn.close()
 
 
 def probe_ob_tenant_connection(config):
-    pymysql = load_pymysql()
-    conn = open_tenant_connection(pymysql, config)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("select 1 as ok")
-            row = cur.fetchone()
-        return {"ok": True, "message": f"租户 {config.get('tenant_name') or ''} 连接成功，SELECT 1 通过", "result": row}
-    finally:
-        conn.close()
+    if is_oracle_tenant(config):
+        if oracle_tenant_driver(config) == "obclient":
+            rows = obclient_query(config, "select 1 as ok from dual")
+            return {"ok": True, "message": f"Oracle租户 {config.get('tenant_name') or ''} obclient 连接成功，SELECT 1 通过", "result": rows}
+        conn = open_oracle_tenant_connection(config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select 1 as ok from dual")
+                row = cur.fetchone()
+            return {"ok": True, "message": f"Oracle租户 {config.get('tenant_name') or ''} 连接成功，SELECT 1 通过", "result": normalize_value(row)}
+        finally:
+            conn.close()
+    else:
+        pymysql = load_pymysql()
+        conn = open_tenant_connection(pymysql, config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select 1 as ok")
+                row = cur.fetchone()
+            return {"ok": True, "message": f"租户 {config.get('tenant_name') or ''} 连接成功，SELECT 1 通过", "result": normalize_value(row)}
+        finally:
+            conn.close()
 
 
 def probe_ob_cluster(cluster):
@@ -71,6 +107,18 @@ def load_pymysql():
     except ImportError as exc:
         raise RuntimeError("缺少 PyMySQL 依赖，请先安装 PyMySQL==1.1.1 后再执行 OB 只读采集") from exc
     return pymysql
+
+
+def load_oracledb():
+    try:
+        import oracledb
+    except ImportError as exc:
+        raise RuntimeError("缺少 python-oracledb 依赖，请先安装 oracledb==2.4.1 后再执行 Oracle 租户采集") from exc
+    return oracledb
+
+
+def is_oracle_tenant(config):
+    return str(config.get("tenant_mode") or "").upper() == "ORACLE"
 
 
 def open_tenant_connection(pymysql, config):
@@ -94,6 +142,49 @@ def open_tenant_connection(pymysql, config):
         )
     except Exception as exc:
         raise RuntimeError(format_ob_connect_error(host, port, user, exc)) from exc
+
+
+def open_oracle_tenant_connection(config):
+    host, port = split_endpoint(config.get("endpoint") or "", config.get("port") or 2881)
+    user = config.get("tenant_user") or ""
+    password = config.get("tenant_password") or ""
+    if not user or not password:
+        raise RuntimeError(f"Oracle 租户 {config.get('tenant_name') or ''} 未配置采集账号或密码")
+
+    driver = oracle_tenant_driver(config)
+    if driver == "pymysql":
+        mysql_config = dict(config)
+        # Only use this compatibility path if the site explicitly enables it.
+        mysql_config["database"] = ""
+        try:
+            return open_tenant_connection(load_pymysql(), mysql_config)
+        except Exception as exc:
+            raise RuntimeError(
+                "Oracle 模式租户已配置为 PyMySQL 兼容连接，但当前 OB 返回该客户端不支持 Oracle 租户。"
+                f"目标 {host}:{port}，用户 {user}；原始错误：{exc}"
+            ) from exc
+
+    oracledb = load_oracledb()
+    service_name = config.get("database") or config.get("tenant_name") or ""
+    if not service_name:
+        raise RuntimeError("python-oracledb 模式需要配置服务名，默认可填写租户名")
+    try:
+        return oracledb.connect(
+            user=user,
+            password=password,
+            dsn=oracledb.makedsn(host, int(port), service_name=service_name),
+        )
+    except Exception as exc:
+        raise RuntimeError(format_oracle_connect_error(host, port, service_name, user, exc)) from exc
+
+
+def oracle_tenant_driver(config):
+    driver = str(config.get("oracle_driver") or os.environ.get("OB_ORACLE_TENANT_DRIVER") or "obclient").lower()
+    if driver in ("pymysql", "mysql"):
+        return "pymysql"
+    if driver in ("oracledb", "oracle", "python-oracledb"):
+        return "oracledb"
+    return "obclient"
 
 
 def open_ob_connection(pymysql, cluster):
@@ -141,6 +232,14 @@ def format_ob_connect_error(host, port, user, exc):
     return f"目标 OB SQL 入口 {host}:{port} 连接失败，当前用户 {user}；原始错误：{raw}"
 
 
+def format_oracle_connect_error(host, port, service_name, user, exc):
+    raw = str(exc)
+    return (
+        f"Oracle租户连接失败：{host}:{port}/{service_name}，"
+        f"当前用户 {user}；原始错误：{raw}"
+    )
+
+
 def split_endpoint(endpoint, default_port):
     value = endpoint.strip()
     if value.startswith("[") and "]" in value:
@@ -155,15 +254,105 @@ def split_endpoint(endpoint, default_port):
 
 def query_first(conn, queries):
     errors = []
+    empty_results = 0
     with conn.cursor() as cur:
         for sql in queries:
             try:
                 ensure_readonly_select(sql)
                 cur.execute(sql)
-                return normalize_rows(cur.fetchall())
+                rows = normalize_rows(cur.fetchall(), cur.description)
+                if rows:
+                    return rows
+                empty_results += 1
             except Exception as exc:
                 errors.append(str(exc))
+    if empty_results and not errors:
+        return []
     return [{"_error": "; ".join(errors[:3])}]
+
+
+def obclient_query_first(config, queries):
+    errors = []
+    empty_results = 0
+    for sql in queries:
+        try:
+            rows = obclient_query(config, sql)
+            if rows:
+                return rows
+            empty_results += 1
+        except Exception as exc:
+            errors.append(str(exc))
+    if empty_results and not errors:
+        return []
+    return [{"_error": "; ".join(errors[:3])}]
+
+
+def obclient_query(config, sql):
+    ensure_readonly_select(sql)
+    host, port = split_endpoint(config.get("endpoint") or "", config.get("port") or 2881)
+    user = config.get("tenant_user") or ""
+    password = config.get("tenant_password") or ""
+    if not user or not password:
+        raise RuntimeError(f"Oracle 租户 {config.get('tenant_name') or ''} 未配置采集账号或密码")
+    sql_text = sql.strip().rstrip(";") + ";"
+    with tempfile.NamedTemporaryFile("w", delete=False) as defaults_file:
+        defaults_file.write("[client]\n")
+        defaults_file.write(f"password={password}\n")
+        defaults_path = defaults_file.name
+    try:
+        cmd = [
+            os.environ.get("OBCLIENT_BIN", "obclient"),
+            f"--defaults-extra-file={defaults_path}",
+            "-h",
+            host,
+            "-P",
+            str(int(port)),
+            "-u",
+            user,
+            "-A",
+            "-B",
+            "-e",
+            sql_text,
+        ]
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=45)
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 obclient，请先安装 OceanBase Client，并确认 obclient 在 PATH 中") from exc
+    finally:
+        try:
+            os.unlink(defaults_path)
+        except OSError:
+            pass
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"obclient 执行失败，目标 {host}:{port}，用户 {user}；{detail[:800]}")
+    return parse_tabular_output(result.stdout)
+
+
+def parse_tabular_output(output):
+    rows = []
+    for line in output.splitlines():
+        line = line.strip("\r\n")
+        if not line:
+            continue
+        values = [normalize_obclient_value(value) for value in line.split("\t")]
+        rows.append(values)
+    return rows_to_dicts(rows)
+
+
+def rows_to_dicts(rows):
+    if not rows:
+        return []
+    columns = [str(column).lower() for column in rows[0]]
+    return [
+        {columns[index]: value for index, value in enumerate(row)}
+        for row in rows[1:]
+    ]
+
+
+def normalize_obclient_value(value):
+    if value in ("NULL", "\\N"):
+        return None
+    return normalize_value(value)
 
 
 def ensure_readonly_select(sql):
@@ -176,10 +365,14 @@ def ensure_readonly_select(sql):
         raise RuntimeError("拒绝执行包含变更关键字的 SQL，OB 采集必须只读")
 
 
-def normalize_rows(rows):
+def normalize_rows(rows, description=None):
     normalized = []
     for row in rows:
-        normalized.append({str(key).lower(): normalize_value(value) for key, value in row.items()})
+        if hasattr(row, "items"):
+            normalized.append({str(key).lower(): normalize_value(value) for key, value in row.items()})
+            continue
+        columns = [str(col[0]).lower() for col in (description or [])]
+        normalized.append({columns[index]: normalize_value(value) for index, value in enumerate(row)})
     return normalized
 
 
@@ -306,6 +499,7 @@ TENANT_DISK_USAGE_QUERIES = [
 TENANT_RESOURCE_QUERIES = [
     """
     select tenant_id,
+           count(distinct unit_id) as unit_num,
            round(sum(max_cpu), 2) as cpu_cores,
            round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
     from oceanbase.GV$OB_UNITS
@@ -313,10 +507,49 @@ TENANT_RESOURCE_QUERIES = [
     """,
     """
     select tenant_id,
+           count(*) as unit_num,
+           round(sum(max_cpu), 2) as cpu_cores,
+           round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
+    from oceanbase.GV$OB_UNITS
+    group by tenant_id
+    """,
+    """
+    select tenant_id,
+           count(distinct unit_id) as unit_num,
            round(sum(cpu_capacity), 2) as cpu_cores,
            round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
     from oceanbase.GV$OB_UNITS
     group by tenant_id
+    """,
+    """
+    select tenant_id,
+           count(*) as unit_num,
+           round(sum(cpu_capacity), 2) as cpu_cores,
+           round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
+    from oceanbase.GV$OB_UNITS
+    group by tenant_id
+    """,
+]
+
+
+TENANT_ZONE_RESOURCE_QUERIES = [
+    """
+    select tenant_id,
+           zone,
+           round(sum(max_cpu), 2) as cpu_cores,
+           round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
+    from oceanbase.GV$OB_UNITS
+    group by tenant_id, zone
+    order by tenant_id, zone
+    """,
+    """
+    select tenant_id,
+           zone,
+           round(sum(cpu_capacity), 2) as cpu_cores,
+           round(sum(memory_size) / 1024 / 1024 / 1024, 2) as memory_gb
+    from oceanbase.GV$OB_UNITS
+    group by tenant_id, zone
+    order by tenant_id, zone
     """,
 ]
 
@@ -379,6 +612,113 @@ TENANT_RUNTIME_QUERIES = [
     select
       (select count(*) from information_schema.processlist) as current_processes,
       @@max_connections as max_processes
+    """,
+]
+
+
+ORACLE_TENANT_TOP_OBJECT_QUERIES = [
+    """
+    select *
+    from (
+        select o.owner as database_name,
+               o.object_name as table_name,
+               o.object_type,
+               round(max(t.data_size) / 1024 / 1024 / 1024, 4) as data_gb,
+               cast(0 as number) as index_gb,
+               round(max(t.data_size) / 1024 / 1024 / 1024, 4) as total_gb,
+               max(dt.num_rows) as table_rows
+        from SYS.DBA_OBJECTS o
+        join SYS.DBA_OB_TABLE_LOCATIONS t
+          on t.database_name = o.owner
+         and t.table_name = o.object_name
+        left join SYS.DBA_TABLES dt
+          on dt.owner = o.owner
+         and dt.table_name = o.object_name
+        where o.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
+          and o.object_type in ('TABLE', 'INDEX', 'LOB', 'LOBSEGMENT', 'TABLE PARTITION', 'INDEX PARTITION')
+          and nvl(t.data_size, 0) > 0
+        group by o.owner, o.object_name, o.object_type
+        order by max(t.data_size) desc
+    )
+    where rownum <= 50
+    """,
+    """
+    select *
+    from (
+        select s.owner as database_name,
+               s.segment_name as table_name,
+               s.segment_type as object_type,
+               round(sum(s.bytes) / 1024 / 1024 / 1024, 4) as data_gb,
+               cast(0 as number) as index_gb,
+               round(sum(s.bytes) / 1024 / 1024 / 1024, 4) as total_gb,
+               max(dt.num_rows) as table_rows
+        from dba_segments s
+        left join dba_tables dt
+          on dt.owner = s.owner
+         and dt.table_name = s.segment_name
+        where s.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
+        group by s.owner, s.segment_name, s.segment_type
+        having sum(s.bytes) > 0
+        order by sum(s.bytes) desc
+    )
+    where rownum <= 50
+    """,
+    """
+    select *
+    from (
+        select user as database_name,
+               s.segment_name as table_name,
+               s.segment_type as object_type,
+               round(sum(s.bytes) / 1024 / 1024 / 1024, 4) as data_gb,
+               cast(0 as number) as index_gb,
+               round(sum(s.bytes) / 1024 / 1024 / 1024, 4) as total_gb,
+               max(ut.num_rows) as table_rows
+        from user_segments s
+        left join user_tables ut
+          on ut.table_name = s.segment_name
+        group by s.segment_name, s.segment_type
+        order by sum(s.bytes) desc
+    )
+    where rownum <= 50
+    """,
+]
+
+
+ORACLE_TENANT_RUNTIME_QUERIES = [
+    """
+    select
+      (select count(*) from SYS.GV$OB_PROCESSLIST) as current_processes,
+      (
+        select case
+                 when max(to_number(value)) > 0 then max(to_number(value))
+                 else null
+               end
+        from SYS.V$OB_PARAMETERS
+        where name = '_resource_limit_max_session_num'
+          and scope = 'TENANT'
+      ) as max_processes
+    from dual
+    """,
+    """
+    select count(*) as current_processes,
+           cast(null as number) as max_processes
+    from GV$OB_PROCESSLIST
+    """,
+    """
+    select current_utilization as current_processes,
+           limit_value as max_processes
+    from v$resource_limit
+    where resource_name = 'processes'
+    """,
+    """
+    select count(*) as current_processes,
+           cast(null as number) as max_processes
+    from v$session
+    """,
+    """
+    select cast(null as number) as current_processes,
+           cast(null as number) as max_processes
+    from dual
     """,
 ]
 

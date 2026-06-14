@@ -176,20 +176,57 @@ GET /api/v2/ob/clusters
 ## 9. 功能说明
 
 - 首页运维全景：展示物理机、虚拟机、故障主机、报警主机、正常主机。
+- Sys 租户健康：首页展示所有集群 sys 租户最近一次检查结果，支持手工立即检查。
 - OB 集群看板：展示集群、租户、数据库、OBServer 摘要。
 - OCP 接入配置：保存 OCP 地址、认证方式、版本和 API 前缀。
 - OCP 同步：从 OCP 读取 OB 集群信息并写入 `clusters` 表。
 - 手工 OB 集群采集：对目标 OB SQL 入口只执行 `SELECT`，读取租户、OBServer、参数等信息并写入本系统 Oracle 资产库。
+- 租户详情采集：MySQL 模式租户使用 PyMySQL；Oracle 模式租户默认调用 `obclient`。两者用户名都按 `用户@租户#集群` 拼接，只执行只读 SQL。
 - 日志捕获：粘贴 OB 日志，解析 `WARN`、`ERROR`、`FATAL`、`OB-xxxx`、`ORA-xxxx` 并写入 `ob_log_events`。
 - 采集任务与错误：Web 只显示成功/失败摘要；详细错误写入 `logs/ob-ops-monitor.log`。
 
-## 10. 只读原则
+Oracle 模式租户需要服务器能直接执行 `obclient`：
+
+```bash
+which obclient
+obclient -h192.168.62.62 -P12883 -u'SYS@thdgxtdb#nqlobcluster' -p -A
+```
+
+如果 `obclient` 不在 PATH，可以设置：
+
+```bash
+export OBCLIENT_BIN=/path/to/obclient
+```
+
+默认不需要设置 `OB_ORACLE_TENANT_DRIVER`。只有现场明确改用其它驱动时才设置为 `oracledb` 或 `pymysql`。
+
+## 10. 定时采集
+
+页面集群列表中的“定时采集”用于配置集群级每日只读采集，只需要设置每天执行时间；“只读采集”按钮仍可随时手工执行。
+
+租户详情页中的定时采集用于采集租户对象容量和运行指标。
+
+sys 租户健康检查默认每 60 分钟执行一次，可在 `config.json` 中调整：
+
+```json
+"app": {
+  "sys_check_interval_minutes": 60
+}
+```
+
+建议使用 cron 每分钟调用一次调度脚本，脚本会自动判断当天是否到达配置时间并避免重复执行：
+
+```bash
+* * * * * cd /opt/ob-asset && . .venv/bin/activate && python run_tenant_schedules.py >> logs/schedule.log 2>&1
+```
+
+## 11. 只读原则
 
 - 对 OCP：程序只发起 `GET` 请求，不创建、不更新、不删除 OCP 配置。
 - 对 OB：程序只执行 `SELECT` 语句，不执行 `INSERT`、`UPDATE`、`DELETE`、`ALTER`、`DROP`、`CREATE`、`SET` 等变更语句。
 - 对本系统 Oracle 资产库：允许写入本系统自己的资产表、配置表和采集任务表。
 
-## 11. 常见问题
+## 12. 常见问题
 
 ### 页面能打开，但显示演示数据
 

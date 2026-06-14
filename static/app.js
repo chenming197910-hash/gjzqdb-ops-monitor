@@ -6,6 +6,7 @@ const state = {
   servers: [],
   logs: [],
   jobs: [],
+  sysChecks: [],
 };
 
 const els = {
@@ -21,7 +22,10 @@ const els = {
   serverRows: document.querySelector("#serverRows"),
   logRows: document.querySelector("#logRows"),
   jobRows: document.querySelector("#jobRows"),
+  sysHealthRows: document.querySelector("#sysHealthRows"),
   ocpRows: document.querySelector("#ocpRows"),
+  tenantClusterFilter: document.querySelector("#tenantClusterFilter"),
+  exportTenants: document.querySelector("#exportTenants"),
   hideStandbyTenants: document.querySelector("#hideStandbyTenants"),
   hideMetaTenants: document.querySelector("#hideMetaTenants"),
   hideStandbyState: document.querySelector("#hideStandbyState"),
@@ -33,6 +37,7 @@ const els = {
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     ...options,
   });
   const text = await response.text();
@@ -45,7 +50,7 @@ async function api(path, options = {}) {
 
 async function loadAll() {
   try {
-    const [health, summary, clusters, tenants, servers, logs, jobs, ocps] = await Promise.all([
+    const [health, summary, clusters, tenants, servers, logs, jobs, sysChecks, ocps] = await Promise.all([
       api("/api/health"),
       api("/api/summary"),
       api("/api/clusters"),
@@ -53,6 +58,7 @@ async function loadAll() {
       api("/api/servers"),
       api("/api/logs"),
       api("/api/collection-jobs"),
+      api("/api/sys-tenant-checks"),
       api("/api/ocp/connections"),
     ]);
     state.clusters = clusters;
@@ -60,27 +66,32 @@ async function loadAll() {
     state.servers = servers;
     state.logs = logs;
     state.jobs = jobs;
+    state.sysChecks = sysChecks;
     state.ocpConnections = ocps;
     els.dbInfo.textContent = `后台 Oracle 资产库已连接（${health.oracle_user}）`;
     setStatus("");
     renderSummary(summary);
+    renderTenantClusterFilter(clusters);
     renderTenantResourceCharts(tenants);
     renderClusters(clusters);
     renderTenants(tenants);
     renderServers(servers);
     renderLogs(logs);
     renderJobs(jobs);
+    renderSysHealth(sysChecks);
     renderOcpConnections(ocps);
   } catch (error) {
     els.dbInfo.textContent = "数据库连接异常";
     setStatus(`数据库未连接或资产表未初始化：${error.message}`);
     renderSummary({});
+    renderTenantClusterFilter([]);
     renderTenantResourceCharts([]);
     renderClusters([]);
     renderTenants([]);
     renderServers([]);
     renderLogs([]);
     renderJobs([]);
+    renderSysHealth([]);
     renderOcpConnections([]);
   }
 }
@@ -199,6 +210,7 @@ function renderClusters(rows) {
       <td>${safe(item.tenant_count)}</td>
       <td>${safe(item.observer_count)}</td>
       <td>${badge(item.status)}</td>
+      <td>${clusterScheduleText(item)}</td>
       <td>${safe(item.owner)}</td>
       <td class="row-actions">
         <button class="small" data-config="${encodeURIComponent(JSON.stringify({
@@ -207,12 +219,18 @@ function renderClusters(rows) {
           port: item.port,
           sys_user: item.sys_user,
         }))}">采集配置</button>
+        <button class="small" data-cluster-schedule="${encodeURIComponent(JSON.stringify({
+          id: item.id,
+          enabled: item.schedule_enabled,
+          run_time: item.schedule_run_time,
+          last_run_at: item.schedule_last_run_at,
+        }))}">定时采集</button>
         <button class="small" data-probe="${safe(item.id)}">测试连接</button>
         <button class="small" data-collect="${safe(item.id)}" data-has-password="${safe(item.has_password)}">${item.has_password ? "只读采集" : "补密码后采集"}</button>
         <button class="small danger" data-delete-cluster="${safe(item.id)}">删除</button>
       </td>
     </tr>
-  `).join("") : emptyRow(12, "暂无 OB 集群，请点击“新增集群”手工录入，或配置 OCP 后同步。");
+  `).join("") : emptyRow(13, "暂无 OB 集群，请点击“新增集群”手工录入，或配置 OCP 后同步。");
   document.querySelectorAll("[data-collect]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.dataset.hasPassword === "0") {
@@ -226,6 +244,9 @@ function renderClusters(rows) {
   document.querySelectorAll("[data-config]").forEach((button) => {
     button.addEventListener("click", () => openCollectConfig(JSON.parse(decodeURIComponent(button.dataset.config))));
   });
+  document.querySelectorAll("[data-cluster-schedule]").forEach((button) => {
+    button.addEventListener("click", () => openClusterSchedule(JSON.parse(decodeURIComponent(button.dataset.clusterSchedule))));
+  });
   document.querySelectorAll("[data-probe]").forEach((button) => {
     button.addEventListener("click", () => probeCluster(button.dataset.probe));
   });
@@ -237,6 +258,12 @@ function renderClusters(rows) {
   });
 }
 
+function clusterScheduleText(item) {
+  if (Number(item.schedule_enabled || 0) !== 1) return "-";
+  const lastRun = item.schedule_last_run_at ? `<br><small>上次 ${safe(item.schedule_last_run_at)}</small>` : "";
+  return `每天 ${safe(item.schedule_run_time || "07:00")}${lastRun}`;
+}
+
 function renderTenants(rows) {
   const filteredRows = filterTenants(rows);
   els.tenantRows.innerHTML = filteredRows.length ? filteredRows.map((item) => `
@@ -245,12 +272,9 @@ function renderTenants(rows) {
       <td>${safe(item.cluster_name)}</td>
       <td><button class="link-button ${tenantRoleClass(item)}" data-tenant-detail="${safe(item.id)}">${safe(item.name)}</button></td>
       <td>${safe(item.tenant_mode)}</td>
-      <td>${safe(item.primary_zone)}</td>
+      <td class="message-cell">${primaryZoneCell(item)}</td>
       <td><span class="${tenantRoleClass(item)}">${safe(item.tenant_role || "-")}</span></td>
-      <td class="message-cell">${tenantRelationText(item, rows)}</td>
       <td>${safe(item.unit_num)}</td>
-      <td>${valueText(item.cpu_cores)}</td>
-      <td>${valueText(item.memory_gb)}</td>
       <td>${backupTimeCell(item.last_full_backup_time)}</td>
       <td>${usageText(item.data_disk_used_gb, item.data_disk_total_gb, item.data_disk_usage_pct)}</td>
       <td>${usageText(item.log_disk_used_gb, item.log_disk_total_gb, item.log_disk_usage_pct)}</td>
@@ -258,14 +282,24 @@ function renderTenants(rows) {
       <td>${badge(item.status)}</td>
       <td class="message-cell">${safe(item.locality)}</td>
     </tr>
-  `).join("") : emptyRow(16, rows.length ? "当前筛选条件下暂无租户。可取消屏蔽 standby/meta 租户查看全量。" : "暂无租户信息。手工集群请点击“只读采集”，OCP 集群请点击“同步 OCP”。");
+  `).join("") : emptyRow(13, rows.length ? "当前筛选条件下暂无租户。可取消屏蔽 standby/meta 租户查看全量。" : "暂无租户信息。手工集群请点击“只读采集”，OCP 集群请点击“同步 OCP”。");
   document.querySelectorAll("[data-tenant-detail]").forEach((button) => {
     button.addEventListener("click", () => openTenantDetail(button.dataset.tenantDetail));
   });
 }
 
+function renderTenantClusterFilter(clusters) {
+  const current = els.tenantClusterFilter.value;
+  const options = clusters.map((item) => `<option value="${safe(item.id)}">${safe(item.name)}</option>`).join("");
+  els.tenantClusterFilter.innerHTML = `<option value="">全部集群</option>${options}`;
+  if ([...els.tenantClusterFilter.options].some((option) => option.value === current)) {
+    els.tenantClusterFilter.value = current;
+  }
+}
+
 function filterTenants(rows) {
   return rows.filter((item) => {
+    if (els.tenantClusterFilter.value && String(item.cluster_id) !== els.tenantClusterFilter.value) return false;
     if (els.hideStandbyTenants.checked && isStandbyTenant(item)) return false;
     if (els.hideMetaTenants.checked && isMetaTenant(item)) return false;
     return true;
@@ -328,37 +362,10 @@ function tenantRowClass(item) {
   return "";
 }
 
-function tenantRelationText(item, rows) {
-  if (isPrimaryTenant(item)) {
-    const standbys = rows.filter((row) =>
-      row.cluster_id === item.cluster_id &&
-      normalizeTenantName(row.name) === normalizeTenantName(item.name) &&
-      isStandbyTenant(row)
-    );
-    if (!standbys.length) return "主；未发现同名备租户";
-    const normalCount = standbys.filter((row) => isNormalTenantStatus(row.status)).length;
-    const delayText = standbys.map((row) => standbyDelayText(row)).filter(Boolean).join("；") || "延迟未采集";
-    return `主；备租户${standbys.length}个，正常${normalCount}个，${delayText}`;
-  }
-  if (isStandbyTenant(item)) {
-    return `备；状态${safe(item.status || "-")}，延迟${standbyDelayText(item) || "未采集"}`;
-  }
-  return "-";
-}
-
-function normalizeTenantName(name) {
-  return String(name || "").toLowerCase().replace(/^standby[_-]?/, "").replace(/[_-]?standby$/, "");
-}
-
-function isNormalTenantStatus(status) {
-  const text = String(status || "").toLowerCase();
-  return ["normal", "online", "available", "running"].some((value) => text.includes(value));
-}
-
-function standbyDelayText(item) {
-  const delay = item.standby_delay_seconds ?? item.sync_delay_seconds ?? item.replay_delay_seconds;
-  if (delay === null || delay === undefined || delay === "") return "";
-  return `延迟${safe(delay)}秒`;
+function primaryZoneCell(item) {
+  const zone = safe(item.primary_zone || "-");
+  const resources = item.zone_resource_summary ? `<br><small>${safe(item.zone_resource_summary)}</small>` : "";
+  return `${zone}${resources}`;
 }
 
 function renderServers(rows) {
@@ -401,9 +408,22 @@ function renderJobs(rows) {
       <td>${safe(item.cluster_name || item.cluster_id || "-")}</td>
       <td>${safe(item.target_type)}</td>
       <td>${badge(item.status)}</td>
-      <td class="message-cell">${safe(item.message)}</td>
+      <td class="message-cell" title="${safe(item.message)}">${safe(item.message)}</td>
     </tr>
   `).join("") : emptyRow(6, "暂无采集任务。点击集群行的“测试连接”或“只读采集”后会在这里记录结果。");
+}
+
+function renderSysHealth(rows) {
+  els.sysHealthRows.innerHTML = rows.length ? rows.map((item) => `
+    <tr class="${item.status && item.status !== "success" ? "health-row-bad" : ""}">
+      <td>${safe(item.cluster_name)}</td>
+      <td>${safe(item.endpoint)}:${safe(item.port)}</td>
+      <td>${safe(item.sys_user)}</td>
+      <td>${badge(item.status || (Number(item.has_password || 0) ? "unchecked" : "failed"))}</td>
+      <td>${safe(item.checked_at || "-")}</td>
+      <td class="message-cell" title="${safe(item.message || "")}">${safe(item.message || (Number(item.has_password || 0) ? "尚未检查" : "未配置密码"))}</td>
+    </tr>
+  `).join("") : emptyRow(6, "暂无集群。");
 }
 
 function renderOcpConnections(rows) {
@@ -538,6 +558,17 @@ document.querySelectorAll("[data-close]").forEach((button) => {
 });
 
 document.querySelector("#refreshNow").addEventListener("click", loadAll);
+document.querySelector("#checkSysNow").addEventListener("click", async () => {
+  try {
+    showToast("正在检查所有集群 sys 租户...");
+    const result = await api("/api/sys-tenant-checks/run", { method: "POST", body: "{}" });
+    showToast(`sys租户检查完成：成功${result.success || 0}，失败${result.failed || 0}`);
+    await loadAll();
+  } catch (error) {
+    showToast(error.message);
+    setStatus(`sys租户检查失败：${error.message}`);
+  }
+});
 els.refreshSeconds.addEventListener("change", () => {
   clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(loadAll, Number(els.refreshSeconds.value) * 1000);
@@ -551,13 +582,45 @@ document.querySelector("#syncOcp").addEventListener("click", async () => {
       return;
     }
     const latest = state.ocpConnections[0];
-    const result = await api(`/api/ocp/connections/${latest.id}/sync`, { method: "POST", body: "{}" });
-    showToast(`OCP同步完成：集群${result.clusters || 0}，OBServer${result.observers || 0}，租户${result.tenants || 0}，数据库${result.databases || 0}`);
+    let result = await syncOcpConnection(latest.id, false);
+    if (result.duplicate_confirmation_required) {
+      const examples = (result.duplicate_database_examples || [])
+        .map((item) => `${item.cluster}/${item.tenant}/${item.database}`)
+        .join("\n");
+      const more = result.duplicate_databases > (result.duplicate_database_examples || []).length
+        ? `\n...另有 ${result.duplicate_databases - result.duplicate_database_examples.length} 个重复数据库`
+        : "";
+      const confirmed = confirm(
+        `发现 ${result.duplicate_databases || 0} 个同集群、同租户、同名数据库。\n` +
+        "本次已跳过这些重复数据库，并继续导入其它资产。\n\n" +
+        `${examples}${more}\n\n是否确认更新这些重复数据库的信息？`
+      );
+      if (confirmed) {
+        result = await syncOcpConnection(latest.id, true);
+      }
+    }
+    showToast(`OCP同步完成：集群${result.clusters || 0}，OBServer${result.observers || 0}，租户${result.tenants || 0}，数据库${result.databases || 0}，重复数据库${result.duplicate_databases || 0}`);
     await loadAll();
   } catch (error) {
     showToast(error.message);
   }
 });
+
+function syncOcpConnection(connectionId, confirmDuplicateDatabases) {
+  return api(`/api/ocp/connections/${connectionId}/sync`, {
+    method: "POST",
+    body: JSON.stringify({ confirm_duplicate_databases: confirmDuplicateDatabases }),
+  });
+}
+
+function exportTenantExcel() {
+  const params = new URLSearchParams({
+    cluster_id: els.tenantClusterFilter.value || "",
+    hide_standby: els.hideStandbyTenants.checked ? "1" : "0",
+    hide_meta: els.hideMetaTenants.checked ? "1" : "0",
+  });
+  window.location.href = `/api/tenants/export.xlsx?${params.toString()}`;
+}
 
 async function collectCluster(clusterId) {
   try {
@@ -634,11 +697,11 @@ function renderTenantDetail(data) {
     </div>
     <section class="detail-section">
       <h3>租户连接</h3>
-      <form id="tenantConnectionForm" class="inline-form">
+      <form id="tenantConnectionForm" class="inline-form" data-oracle-tenant="${isOracleTenant(t) ? "1" : "0"}">
         <label>用户名<input name="tenant_user" value="${safe(baseTenantUser(conn.tenant_user || ""))}" placeholder="例如 root"></label>
         <label>固定租户/集群<input value="@${safe(t.name)}#${safe(t.cluster_name)}" disabled></label>
         <label>实际登录用户<input id="tenantLoginPreview" value="${safe(buildTenantLoginPreview(conn.tenant_user || "", t))}" disabled></label>
-        <label>默认库<input name="database_name" value="${safe(conn.database_name || "")}" placeholder="可留空"></label>
+        <label>${isOracleTenant(t) ? "服务名" : "默认库"}<input name="database_name" value="${safe(conn.database_name || "")}" placeholder="${isOracleTenant(t) ? safe(t.name) : "可留空"}"></label>
         <label>密码<input name="tenant_password" type="password" placeholder="${conn.has_password ? "留空保留原密码" : "请输入密码"}"></label>
         <button type="submit" class="primary">保存连接</button>
         <button type="button" data-tenant-test="${safe(t.id)}">测试连接</button>
@@ -710,8 +773,12 @@ function bindTenantDetailActions(tenantId) {
     try {
       const result = await api(`/api/tenants/${tenantId}/connection/test`, { method: "POST", body: JSON.stringify(formToPayload(form)) });
       showToast(result.message || "租户连接测试成功");
+      await loadAll();
     } catch (error) {
       showToast(error.message);
+      setStatus(`租户连接测试失败：${error.message}`);
+      await loadAll();
+      scrollToSection("jobsSection");
     }
   });
   document.querySelector("#tenantScheduleForm").addEventListener("submit", async (event) => {
@@ -724,6 +791,9 @@ function bindTenantDetailActions(tenantId) {
       await openTenantDetail(tenantId);
     } catch (error) {
       showToast(error.message);
+      setStatus(`租户详情采集失败：${error.message}`);
+      await loadAll();
+      scrollToSection("jobsSection");
     }
   });
   document.querySelector("[data-tenant-collect]").addEventListener("click", async () => {
@@ -746,6 +816,7 @@ function bindTenantLoginPreview() {
   const input = form.elements.tenant_user;
   const preview = document.querySelector("#tenantLoginPreview");
   const suffix = form.querySelector("input[disabled]").value;
+  const oracleTenant = form.dataset.oracleTenant === "1";
   const update = () => {
     input.value = baseTenantUser(input.value);
     preview.value = `${input.value || ""}${suffix}`;
@@ -762,6 +833,10 @@ function baseTenantUser(user) {
 function buildTenantLoginPreview(user, tenant) {
   const base = baseTenantUser(user);
   return `${base || ""}@${tenant.name}#${tenant.cluster_name}`;
+}
+
+function isOracleTenant(tenant) {
+  return String(tenant.tenant_mode || "").toUpperCase() === "ORACLE";
 }
 
 function bindScheduleForm() {
@@ -909,12 +984,12 @@ function renderClusterDetail(data) {
       <div><span>版本</span><b>${safe(c.version)}</b></div>
       <div><span>状态</span><b>${safe(c.status)}</b></div>
     </div>
-    ${detailTable("租户", ["租户", "模式", "Primary Zone", "主备角色", "主备状态", "上次全备份", "数据盘", "日志盘", "上次成功合并", "状态", "Locality"], data.tenants.map((t) => [
+    ${detailTable("租户", ["租户", "模式", "Primary Zone", "主备角色", "Unit数", "上次全备份", "数据盘", "日志盘", "上次成功合并", "状态", "Locality"], data.tenants.map((t) => [
       t.name,
       t.tenant_mode,
-      t.primary_zone,
+      htmlCell(primaryZoneCell(t)),
       t.tenant_role,
-      tenantRelationText(t, data.tenants),
+      t.unit_num,
       t.last_full_backup_time || "-",
       usagePlain(t.data_disk_used_gb, t.data_disk_total_gb, t.data_disk_usage_pct),
       usagePlain(t.log_disk_used_gb, t.log_disk_total_gb, t.log_disk_usage_pct),
@@ -1013,6 +1088,14 @@ function openCollectConfig(config) {
   openModal("collectConfigModal");
 }
 
+function openClusterSchedule(config) {
+  const form = document.querySelector("#clusterScheduleForm");
+  form.elements.cluster_id.value = config.id || "";
+  form.elements.enabled.checked = Number(config.enabled || 0) === 1;
+  form.elements.run_time.value = config.run_time || "07:00";
+  openModal("clusterScheduleModal");
+}
+
 document.querySelector("#collectConfigForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const payload = formToPayload(event.currentTarget);
@@ -1025,6 +1108,26 @@ document.querySelector("#collectConfigForm").addEventListener("submit", async (e
     });
     showToast("采集配置已保存");
     closeModal("collectConfigModal");
+    event.currentTarget.reset();
+    await loadAll();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+document.querySelector("#clusterScheduleForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formToPayload(event.currentTarget);
+  const clusterId = payload.cluster_id;
+  payload.enabled = Boolean(event.currentTarget.elements.enabled.checked);
+  delete payload.cluster_id;
+  try {
+    await api(`/api/clusters/${clusterId}/schedule`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    showToast("集群每日采集计划已保存");
+    closeModal("clusterScheduleModal");
     event.currentTarget.reset();
     await loadAll();
   } catch (error) {
@@ -1086,6 +1189,11 @@ els.hideMetaTenants.addEventListener("change", () => {
   renderTenantResourceCharts(state.tenants);
   renderTenants(state.tenants);
 });
+els.tenantClusterFilter.addEventListener("change", () => {
+  renderTenantResourceCharts(state.tenants);
+  renderTenants(state.tenants);
+});
+els.exportTenants.addEventListener("click", exportTenantExcel);
 
 updateTenantFilterStates();
 loadAll();
