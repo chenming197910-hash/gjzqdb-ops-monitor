@@ -29,3 +29,6 @@ snapshots/
 .tenant_inspection.key
 
 .tenant_inspection.lock
+
+# Explicitly published deployment packages
+!packages/*.zip
