@@ -14,13 +14,17 @@ def main():
         try:
             result=collect_homepage(db)
             print(result)
-            nodes=all_rows(db, """select distinct c.name as cluster_name, o.svr_ip
+            nodes=all_rows(db, """select distinct c.name as cluster_name, o.svr_ip, c.sys_user, c.sys_password
                 from ob_servers o join clusters c on c.id = o.cluster_id
                 where o.svr_ip is not null""")
             config=CONFIG.get('odp_monitor', {})
             if config.get('enabled', True):
                 snapshot=collect_connections(nodes, config, BASE_DIR / 'data')
                 print('ODP clusters sampled:', len(snapshot['clusters']))
+                missing = {ip: reason for row in snapshot['clusters'].values()
+                           for ip, reason in row['limit_failures'].items()}
+                if missing:
+                    print('ODP connection limits unavailable:', missing)
             if result['failed']:raise SystemExit(1)
         finally:db.close()
 

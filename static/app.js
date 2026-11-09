@@ -225,9 +225,13 @@ function odpConnections(item) {
 
 function odpLimit(item) {
   const odp = item.odp_connections;
-  if (!odp || odp.limit == null) return "未录入实测上限";
+  if (!odp) return "待采集";
+  const coverage = `${odp.limit_nodes || 0}/${odp.nodes} 节点`;
+  if (odp.limit == null || !odp.limit_failures) {
+    return `待自动采集<br><small>${safe(coverage)}</small>`;
+  }
   return `${safe(odp.limit)}${odp.shared ? "（共享）" : ""}
-    <br><small>实例配置汇总</small>`;
+    <br><small>实测 · ${safe(coverage)}</small>`;
 }
 
 function renderClusters(rows) {

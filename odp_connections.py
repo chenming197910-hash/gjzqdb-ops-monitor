@@ -10,6 +10,8 @@ import tempfile
 
 import requests
 
+from ob_collector import load_pymysql
+
 SAMPLE = re.compile(r'^odp_current_session\{(?P<labels>.*)\}\s+(?P<value>\S+)(?:\s+\d+)?$')
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 SNAPSHOT = 'odp_connections.json'
@@ -54,14 +56,41 @@ def collect_node(ip, port):
     return parse_client_sessions(body.decode('utf-8'))
 
 
+def query_client_limit(ip, port, node):
+    """Read the configuration of one ODP instance through its own SQL endpoint."""
+    user = str(node.get('sys_user') or 'root@sys').strip()
+    if '#' not in user and ':' not in user:
+        if '@' not in user:
+            user += '@sys'
+        user += '#' + node['cluster_name']
+    driver = load_pymysql()
+    conn = driver.connect(host=str(ipaddress.ip_address(ip)), port=port, user=user,
+                          password=node['sys_password'], charset='utf8mb4',
+                          connect_timeout=2, read_timeout=3, write_timeout=3)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SHOW PROXYCONFIG LIKE 'client_max_connections'")
+            rows = cursor.fetchall()
+            if len(rows) != 1 or str(rows[0][0]).casefold() != 'client_max_connections':
+                raise ValueError('ODP did not return client_max_connections')
+            value = int(rows[0][1])
+            if value < 0:
+                raise ValueError('ODP client_max_connections is invalid')
+            return value
+    finally:
+        conn.close()
+
+
 def collect_connections(nodes, config, directory, now=None):
-    names_by_ip = {}
+    nodes_by_ip = {}
     for node in nodes:
-        names_by_ip.setdefault(node['svr_ip'], set()).add(node['cluster_name'].casefold())
+        nodes_by_ip.setdefault(node['svr_ip'], {})[node['cluster_name'].casefold()] = node
+    names_by_ip = {ip: set(owners) for ip, owners in nodes_by_ip.items()}
     port = int(config.get('metrics_port', 2884))
     if not 1 <= port <= 65535:
         raise ValueError('ODP metrics_port must be in 1..65535')
-    limits = config.get('client_max_connections_by_ip', {})
+    sql_ports = config.get('sql_port_by_ip', {})
+    default_sql_port = config.get('sql_port', 2883)
     aliases = config.get('cluster_labels', {})
     aliases = {name.casefold(): label.casefold() for name, label in aliases.items()}
     if len(set(aliases.values())) != len(aliases):
@@ -69,12 +98,27 @@ def collect_connections(nodes, config, directory, now=None):
 
     def read(ip):
         try:
-            return collect_node(ip, port)
+            sample = collect_node(ip, port)
         except (requests.RequestException, ValueError):
-            return None
+            return None, None, 'metrics_unavailable'
+        # Use the credentials of the node's matching cluster once, without trying other passwords.
+        owners = [node for name, node in nodes_by_ip[ip].items()
+                  if aliases.get(name, name) in sample and node.get('sys_password')]
+        if len(owners) != 1:
+            return sample, None, 'no_unique_sys_credentials'
+        try:
+            sql_port = int(sql_ports.get(ip, default_sql_port))
+            if not 1 <= sql_port <= 65535:
+                raise ValueError('invalid SQL port')
+            return sample, query_client_limit(ip, sql_port, owners[0]), None
+        except (load_pymysql().MySQLError, OSError, ValueError, TypeError) as exc:
+            # Persist only numeric codes, never driver messages or credentials.
+            code = exc.args[0] if exc.args else None
+            return sample, None, f'sql_{code}' if isinstance(code, int) else 'sql_unavailable'
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        samples = dict(zip(names_by_ip, pool.map(read, names_by_ip)))
+        readings = dict(zip(names_by_ip, pool.map(read, names_by_ip)))
+    samples = {ip: reading[0] for ip, reading in readings.items()}
 
     results = {}
     for name in sorted({name for names in names_by_ip.values() for name in names}):
@@ -83,8 +127,7 @@ def collect_connections(nodes, config, directory, now=None):
         ips = {ip for ip, names in names_by_ip.items()
                if name in names or label in (samples[ip] or {})}
         counts = [samples[ip][label] for ip in ips if label in (samples[ip] or {})]
-        caps = [limits.get(ip) for ip in ips]
-        known_caps = [cap for cap in caps if type(cap) is int and cap > 0]
+        known_caps = [readings[ip][1] for ip in ips if readings[ip][1] is not None]
         shared = any(len(names_by_ip[ip]) > 1 or
                      any(other != label and value > 0 for other, value in (samples[ip] or {}).items())
                      or name not in names_by_ip[ip] for ip in ips)
@@ -94,6 +137,7 @@ def collect_connections(nodes, config, directory, now=None):
             reachable_nodes=sum(samples[ip] is not None for ip in ips),
             limit=sum(known_caps) if len(known_caps) == len(ips) else None,
             limit_nodes=len(known_caps), shared=shared,
+            limit_failures={ip: readings[ip][2] for ip in sorted(ips) if readings[ip][2]},
         )
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)

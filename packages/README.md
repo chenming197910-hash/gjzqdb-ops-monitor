@@ -34,3 +34,9 @@
 ```
 
 `oblb` 可选，用于标注独立入口。已有内网资产页的现场部署保留现有资产数据，覆盖源码前先将其迁入现场配置。
+
+## ODP 连接上限自动采集增量
+
+[ODP 自动采集增量包](OB_monitor_odp_auto_limits_update.zip) 基于资产管理和 ODP 连接统计增量。部署后重载 Web，运行一次首页小时采集服务。无需数据库迁移。
+
+小时采集使用已有的集群 SYS 凭据逐台查询 ODP 的 `client_max_connections`。默认 SQL 端口为 2883，特殊节点可在 `odp_monitor.sql_port_by_ip` 中覆盖。此前的 `client_max_connections_by_ip` 静态上限配置已由自动查询取代。查询失败的节点和错误码可在首页小时采集服务日志中查看。
