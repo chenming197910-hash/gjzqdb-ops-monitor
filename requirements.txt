@@ -5,3 +5,4 @@ requests==2.32.3
 PyMySQL==1.1.1
 
 Werkzeug==2.3.8
+cryptography>=3.2.1

@@ -62,7 +62,7 @@ DEFAULT_OCP_VERSION = os.environ.get(
     "DEFAULT_OCP_VERSION",
     APP_CONFIG.get("default_ocp_version", "4.3.5-20250610160438"),
 )
-DEFAULT_OB_VERSION = os.environ.get("DEFAULT_OB_VERSION", APP_CONFIG.get("default_ob_version", "4.2.1.8"))
+DEFAULT_OB_VERSION = ""  # Version comes from OB collection, not a configured guess.
 POOL_MIN = int(os.environ.get("ORACLE_POOL_MIN", POOL_CONFIG.get("min", 1)))
 POOL_MAX = int(os.environ.get("ORACLE_POOL_MAX", POOL_CONFIG.get("max", 5)))
 POOL_INCREMENT = int(os.environ.get("ORACLE_POOL_INCREMENT", POOL_CONFIG.get("increment", 1)))
@@ -524,6 +524,9 @@ def create_app():
         tenant = get_tenant_with_cluster(g.db, tenant_id)
         if not tenant:
             return jsonify({"error": "tenant not found"}), 404
+        from tenant_inspection import managed
+        if managed(g.db,tenant):
+            return jsonify({'message':'该租户已纳入每日巡检，请使用独立巡检页，避免重复登录'}),409
         payload = request.get_json(force=True) if request.data else {}
         connection = one(g.db, "select * from tenant_connections where tenant_id = :tenant_id", {"tenant_id": tenant_id}) or {}
         config = {
@@ -622,6 +625,9 @@ def create_app():
             return jsonify({"error": "tenant not found"}), 404
         if tenant.get('active') != 1:
             return jsonify({'error':'tenant inactive','message':'租户已停采，请先核验资产状态'}),409
+        from tenant_inspection import managed
+        if managed(g.db,tenant):
+            return jsonify({'message':'该租户已纳入每日巡检，请使用独立巡检页，避免重复登录'}),409
         connection = one(g.db, "select * from tenant_connections where tenant_id = :tenant_id", {"tenant_id": tenant_id})
         if not connection or not connection.get("tenant_password"):
             return jsonify({"error": "tenant connection missing", "message": "请先保存租户采集账号和密码"}), 400
@@ -1097,6 +1103,8 @@ def create_app():
         g.db.commit()
         return jsonify({"id": new_id, "status": "success"}), 201
 
+    from tenant_inspection import register_routes
+    register_routes(app)
     return app
 
 
@@ -1194,7 +1202,7 @@ def upsert_cluster(db, payload):
             """
             update clusters
             set environment = :environment, region = :region, endpoint = :endpoint,
-                port = :port, sys_user = :sys_user, version = :version,
+                port = :port, sys_user = :sys_user, version = coalesce(nullif(:version, ''),version),
                 sys_password = case when :sys_password is null or :sys_password = ''
                                     then sys_password else :sys_password end,
                 status = :status, owner = :owner, remark = :remark,
@@ -1758,6 +1766,9 @@ def store_tenant_detail(db, tenant_id, collected):
 
 
 def collect_cluster_assets(db, cluster_id, collected):
+    if collected.get('cluster_version'):
+        execute(db,'update clusters set version=:version,updated_at=systimestamp where id=:id',
+                {'version':collected['cluster_version'],'id':cluster_id})
     stats = {
         "observers": 0,
         "servers": 0,
@@ -1770,6 +1781,8 @@ def collect_cluster_assets(db, cluster_id, collected):
         "parameters": 0,
         "warnings": [],
     }
+    if 'cluster_version' in collected and not collected['cluster_version']:
+        stats['warnings'].append('无法读取集群实际版本，保留已有版本值；请核查视图权限')
     for observer in collected.get("observers", []):
         if observer.get("_error"):
             stats["warnings"].append(f"OBServer采集失败: {observer['_error'][:300]}")
@@ -2937,6 +2950,9 @@ DDL = [
 
 ]
 
+
+from inspection_schema import DDL as INSPECTION_DDL
+DDL += INSPECTION_DDL
 
 app = create_app()
 

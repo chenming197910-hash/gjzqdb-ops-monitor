@@ -21,6 +21,7 @@ def collect_ob_cluster(cluster):
         authoritative = bool(inventory) and not any(r.get('_error') for r in inventory) and any(str(r.get('tenant_id')) == '1' and r.get('name') == 'sys' for r in inventory)
         return {
             "readonly": True,
+            "cluster_version": read_cluster_version(conn),
             "inventory_authoritative": authoritative,
             "inventory_names": [r.get('name') for r in inventory if r.get('name') != 'sys'] if authoritative else [],
             "observers": query_first(conn, OBSERVER_QUERIES),
@@ -35,6 +36,22 @@ def collect_ob_cluster(cluster):
     finally:
         conn.close()
 
+
+
+def parse_cluster_version(value):
+    text=str(value or '')
+    # BUILD_VERSION starts with OB's version; VERSION() may start with MySQL's.
+    match=re.search(r'oceanbase[^0-9]*(\d+\.\d+\.\d+(?:\.\d+)?)',text,re.I)
+    if not match:match=re.search(r'(?<![0-9.])(\d+\.\d+\.\d+\.\d+)(?![0-9.])',text)
+    return match.group(1) if match else ''
+
+
+def read_cluster_version(conn):
+    rows=query_first(conn,["select distinct build_version from oceanbase.DBA_OB_SERVERS"])
+    versions=sorted({parse_cluster_version(r.get('build_version')) for r in rows if not r.get('_error')}-{''})
+    if versions:return ', '.join(versions)[:64]
+    rows=query_first(conn,["select version() as ob_version"])
+    return next((v for v in (parse_cluster_version(r.get('ob_version')) for r in rows) if v),'')
 
 def collect_ob_tenant_detail(config):
     if is_oracle_tenant(config):

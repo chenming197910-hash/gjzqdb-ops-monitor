@@ -209,7 +209,7 @@ function renderClusters(rows) {
       <td>${safe(item.region)}</td>
       <td>${safe(item.endpoint)}</td>
       <td>${safe(item.port)}</td>
-      <td>${safe(item.version)}</td>
+      <td>${safe(item.version || "待采集")}</td>
       <td>${safe(item.tenant_count)}</td>
       <td>${safe(item.observer_count)}</td>
       <td>${badge(item.status)}</td>
@@ -576,7 +576,7 @@ function resetClusterDefaults(form) {
   form.elements.port.value = 2881;
   form.elements.sys_user.value = "root@sys";
   form.elements.sys_password.value = "";
-  form.elements.version.value = "4.2.1.8";
+  form.elements.version.value = "";
   form.elements.owner.value = "DBA";
 }
 
@@ -1060,7 +1060,7 @@ function renderClusterDetail(data) {
       <div><span>区域</span><b>${safe(c.region)}</b></div>
       <div><span>连接地址</span><b>${safe(c.endpoint)}:${safe(c.port)}</b></div>
       <div><span>系统用户</span><b>${safe(c.sys_user)}</b></div>
-      <div><span>版本</span><b>${safe(c.version)}</b></div>
+      <div><span>版本</span><b>${safe(c.version || "待采集")}</b></div>
       <div><span>状态</span><b>${safe(c.status)}</b></div>
     </div>
     ${detailTable("租户", ["租户", "模式", "Primary Zone", "主备角色", "Unit数", "上次全备份", "数据盘", "日志盘", "上次成功合并", "状态", "Locality"], data.tenants.map((t) => [

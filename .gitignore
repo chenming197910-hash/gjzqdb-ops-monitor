@@ -25,3 +25,7 @@ Thumbs.db
 work/
 outputs/
 snapshots/
+
+.tenant_inspection.key
+
+.tenant_inspection.lock

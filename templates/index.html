@@ -21,7 +21,7 @@
           <option value="60">60秒</option>
         </select>
       </label>
-      <button id="refreshNow">刷新</button>
+      <a class="cpu-history-link" href="/tenant-inspection">业务租户每日巡检 ↗</a><button id="refreshNow">刷新</button>
     </div>
   </header>
 
@@ -311,7 +311,7 @@
         <label>SQL端口<input name="port" type="number" value="2881"></label>
         <label>系统用户<input name="sys_user" required value="root@sys" placeholder="root@sys 或 root@sys#集群名"></label>
         <label>系统用户密码<input name="sys_password" type="password" placeholder="用于只读采集 OB 元数据"></label>
-        <label>OB版本<input name="version" value="4.2.1.8"></label>
+        <label>OB版本<input name="version" placeholder="留空，由实际采集更新"></label>
         <label>状态<select name="status"><option value="online">online</option><option value="offline">offline</option><option value="unknown">unknown</option></select></label>
         <label>负责人<input name="owner" value="DBA"></label>
         <label class="span-2">备注<input name="remark" placeholder="手工录入"></label>

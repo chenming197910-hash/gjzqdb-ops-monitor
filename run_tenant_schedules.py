@@ -84,6 +84,8 @@ def collect_one(db, schedule):
     connection = one(db, "select * from tenant_connections where tenant_id = :tenant_id", {"tenant_id": tenant_id})
     if not tenant or tenant.get("active", 1) != 1 or not connection or not connection.get("tenant_password"):
         return
+    from tenant_inspection import managed
+    if managed(db,tenant):return
     started = local_now()
     try:
         collected = collect_ob_tenant_detail(

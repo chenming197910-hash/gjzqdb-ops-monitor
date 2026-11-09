@@ -24,6 +24,7 @@ cd /root/gjzqdb
 ```sh
 .venv/bin/python schema_migrate.py
 .venv/bin/python schema_migrate.py --apply
+.venv/bin/python migrate_inspection.py --apply
 .venv/bin/python schema_preflight.py
 ```
 
@@ -92,3 +93,7 @@ curl -sS http://127.0.0.1:8000/api/cpu-history/status
 ## 6. 保留数据回滚
 
 暂停新定时器及正在运行的对应采集服务；恢复上线前已验证的完整源码和原服务配置，保留现场 config.json；重载 Web 并恢复原调度。保留扩展表及 CPU 历史，不默认 DROP，不批量改 ACTIVE。若需恢复特定租户/计划状态，使用明确记录和源端只读核验逐项处理。DDL 回滚或整库恢复另行评估，不混入源码替换操作。
+
+## 7. 每日巡检新增迁移
+
+当前版本还需审阅并执行 `python migrate_inspection.py --apply`，新增巡检配置、身份锁和每日尝试记录。新库 `init_db()` 已包含这些表；已有库的 schema_migrate 仍只负责原基础扩展，不替代每日巡检迁移。默认不启用登录。安装、预算和确认规则详见 [DAILY_INSPECTION.md](DAILY_INSPECTION.md)。

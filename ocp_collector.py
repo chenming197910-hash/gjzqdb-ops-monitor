@@ -134,7 +134,7 @@ def normalize_ocp_clusters(items):
                 "endpoint": str(endpoint),
                 "port": int(pick(item, "port", "sqlPort") or 2881),
                 "sys_user": "root@sys",
-                "version": str(pick(item, "version", "obVersion", "clusterVersion") or "4.2.1.8"),
+                "version": str(pick(item, "version", "obVersion", "clusterVersion") or ""),
                 "status": str(pick(item, "status", "state") or "unknown").lower(),
                 "owner": "OCP",
                 "remark": f"OCP cluster id: {pick(item, 'id', 'clusterId') or ''}",

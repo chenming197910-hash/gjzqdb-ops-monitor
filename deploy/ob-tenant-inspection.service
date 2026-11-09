@@ -1,0 +1,10 @@
+[Unit]
+Description=OceanBase daily business tenant inspection
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gjzqdb
+ExecStart=/root/gjzqdb/.venv/bin/python /root/gjzqdb/run_daily_inspection.py
+Environment=TZ=Asia/Shanghai
+TimeoutStartSec=7200
