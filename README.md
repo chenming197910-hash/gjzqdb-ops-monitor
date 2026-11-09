@@ -1,109 +1,56 @@
-# OB 运维监控平台
+# OceanBase 运维监控平台
 
-用于收集公司 OceanBase 资产、展示运维全景、捕获错误日志，并通过 OCP 同步 OB 集群信息。
+基于 Flask、Oracle 资产库及 OceanBase SYS 只读采集的运维监控平台。支持集群/租户资产、健康检查、备份/合并风险、日志、CPU 历史与定时采集。
 
-## 现场版本
+## 功能
 
-- OCP：`4.3.5-20250610160438`
-- OB：`4.2.1.8`
-- 后台资产库：Oracle 19c PDB
-- 部署系统：RHEL 7.9
+- 总览展示集群、租户、OBServer、主机、资源、备份、磁盘与合并信息；失败接口不会清空其他已加载区域。
+- SYS 健康列表保留每个集群，凌晨合并错误/暂停或超过截止时间未完成时整行标红；未知与失败明确区分。
+- 备份风险统计、租户明细与导出共用口径，支持卡片定位风险明细。
+- 已删除租户经两次完整 SYS 清单确认、间隔至少 30 分钟后软停采，保留历史及原计划状态；空/失败/部分清单不触发停采。
+- CPU 约每 5 分钟读取 `GV$SYSSTAT` 的 140013/140005，以累计时间差分计算区间平均核数和使用率，Oracle 存储，支持最近 7/14/30/60 天查询、CSV、多租户对比和缺采断线。
+- CPU 历史页包含 SYS，默认隐藏 meta，可切换显示；已停采租户不再列出。SYS 历史独立存储，不混入业务租户数和备份统计。
+- 每小时自动刷新首页 SYS/合并检查、集群/租户基础信息及启用的日志源；保留手工入口和原专项计划。CPU 使用独立五分钟定时器。
+- 支持 OCP 接入、租户详情、对象及运行指标专项采集、Excel 导出、observer 日志读取。
 
-## 已实现功能
+## 环境与配置
 
-- 首页运维全景：物理机、虚拟机、故障主机、报警主机、正常主机。
-- Sys 租户健康：集中展示所有集群 sys 租户最近一次连接检查结果，默认每 60 分钟自动检查一次。
-- OB 集群看板：容量、CPU、内存、租户、数据库、OBServer 摘要。
-- Oracle 资产库：保存集群、服务器、租户、数据库、OBServer、日志事件。
-- OCP 接入配置：支持 OCP 地址、账号密码、Bearer Token、HTTPS 证书校验开关。
-- OCP 同步：测试调用 `/api/v2/info`，集群同步调用 `/api/v2/ob/clusters`。
-- 手工 OB 集群采集：只读连接目标 OB SQL 入口，采集租户、OBServer、参数、租户全备份时间、数据盘/日志盘使用率和上次成功合并信息。
-- Oracle 模式租户详情采集：默认调用 `obclient` 连接 OB Oracle 租户，用户名按 `用户@租户#集群` 拼接。
-- OB 日志捕获：解析 `WARN`、`ERROR`、`FATAL`、`OB-xxxx`、`ORA-xxxx`。
-- 服务器日志：Web 只显示采集失败摘要，详细错误写入 `logs/ob-ops-monitor.log`。
+现有部署目标为 Python 3.8、Oracle 19c 和 OceanBase 4.2.x；不同补丁版本、权限与视图字段需要在目标环境验证。生产 Web 使用 Gunicorn；systemd 模板面向 Linux。
 
-## Oracle 19c PDB 准备
-
-```sql
-alter session set container = gjzqdb;
-
-create user gjzqdbsys identified by "现场输入的密码";
-grant create session, create table, create sequence, create view to gjzqdbsys;
-grant unlimited tablespace to gjzqdbsys;
-```
-
-## 配置文件
-
-复制配置模板：
-
-```bash
-cp config.example.json config.json
-vi config.json
-```
-
-现场默认配置：
-
-```json
-{
-  "oracle": {
-    "user": "gjzqdbsys",
-    "password": "请在这里填写数据库密码",
-    "dsn": "10.50.40.182:1521/gjzqdb"
-  },
-  "app": {
-    "log_dir": "logs"
-  }
-}
-```
-
-密码包含特殊字符时可以直接写在 JSON 字符串里；如果密码里包含双引号 `"`，需要写成 `\"`；如果包含反斜杠 `\`，需要写成 `\\`。
-
-## RHEL 7.9 部署
-
-```bash
-sudo yum install -y python3
-sudo useradd -r -m obasset
-sudo mkdir -p /opt/ob-asset
-sudo chown -R obasset:obasset /opt/ob-asset
-
-cd /opt/ob-asset
+```sh
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-python -c "from app import init_db; init_db(seed=True)"
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
-tail -f logs/ob-ops-monitor.log
+.venv/bin/pip install -r requirements.txt
+cp config.example.json config.json
 ```
 
-`python-oracledb` 默认使用 Thin 模式，通常不需要安装 Oracle Instant Client。
+编辑本机 `config.json`，填写真实资产库连接。示例只含占位值，代码不再提供现场数据库地址作为默认值。也可使用 `APP_CONFIG` 指定配置文件，或使用 `ORACLE_USER`、`ORACLE_PASSWORD`、`ORACLE_DSN` 环境变量；非空配置文件字段优先于对应环境变量。
 
-## OCP 接入方式
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+node tests/test_frontend.js
+```
 
-页面点击“ OCP接入 ”，填写：
+Node 18+ 仅用于前端离线检查，不是运行 Web 的必要依赖。
 
-- OCP 地址，例如 `https://ocp.example.com`
-- OCP 版本，默认 `4.3.5-20250610160438`
-- API 前缀，默认 `/api/v2`
-- 认证方式：账号密码或 Bearer Token
-- 如果 OCP 使用自签名证书，可以取消“校验HTTPS证书”
+## 部署与升级
 
-保存后点击“同步OCP”。程序会：
+完整步骤见 [DEPLOY_README.md](DEPLOY_README.md)，包括初始化/增量迁移、独立 CPU 与每小时任务、只读核查、重载及保留数据回滚。不要直接在生产执行 `python app.py`：该开发入口会初始化 schema 并启用 debug。
 
-1. 调用 `GET /api/v2/info` 测试 OCP 连接。
-2. 调用 `GET /api/v2/ob/clusters` 获取 OB 集群。
-3. 将集群写入 Oracle 资产库 `clusters` 表。
-4. 如果 OCP 返回里没有 OB 版本字段，默认写入 `4.2.1.8`。
+- 新资产库：明确确认配置指向目标库后运行 `init_db()`；不自动导入真实资产或凭据。
+- 已有资产库：先审阅 `schema_migrate.py`，默认只打印增量 DDL；`--apply` 才执行。已有同名对象还需使用 `schema_preflight.py` 检查字段/约束。
+- `audit_tenant_inventory.py` 只读对比 SYS 清单和本地租户状态，输出恢复复核候选，不自动恢复 ACTIVE 或计划。
 
-## 只读原则
+## 数据口径与边界
 
-- 对 OCP 只发起 `GET` 请求，不修改 OCP。
-- 对 OB 只执行 `SELECT`，不修改 OB。
-- 只向本系统 Oracle 资产库写入资产、配置和采集任务记录。
+- “24 小时未备份”表示有效业务租户超过 24 小时未取得成功全备，包含空备份时间，排除 meta$/standby；周末也使用同一 24 小时口径，不等于失败任务数。
+- CPU 是采样区间平均值，不是瞬时值。首次只建基线；重置、配额变化或超过 15 分钟的间隔跳过重建，历史不会补零。
+- CPU 采集不读取 AWR 历史；部署前历史无法由此采集器追溯。支持查询最近 60 天，但不自动清理旧数据。
+- CPU 状态卡片当前需打开页面或点击“刷新状态”更新；显示时间不是后台定时任务触发日志。采样包含 290 秒防重复检查，重启定时器可能使提前触发的一轮跳过。
+- SYS 重启当前通过计数器回退检测，尚未结合 STARTUP_TIME；源视图完全缺失的节点也尚无独立拓扑完整性校验，须与 OCP 对照验证。
+- 集群“采集正常”不代表该集群每个租户都有样本。已有每日/专项计划可能在基础小时采集外额外执行。
 
-## 后续建议
+## 验证
 
-- 补充 OCP 主机、OBServer、租户、数据库、告警、性能指标接口映射。
-- 对 OCP 密码和 Token 做加密存储。
-- 增加定时同步任务和同步历史页面。
-- 根据 OCP 返回字段做现场适配，主要调整 `ocp_collector.py`。
+本次整理的版本通过 42 项离线 Python 测试及 Node 前端检查，另外通过 Python 3.8 语法检查。数据库和源端调用在单元测试边界替换为模拟；这些结果不能代替真实 Oracle/OceanBase SQL、权限、目标 Linux/Python 3.8 和长期调度联调。
+
+仓库不包含真实 `config.json`、数据库/SSH 凭据、日志、历史样本、虚拟环境、部署压缩包或现场截图。请在受控内网部署并由现有访问控制保护 Web；本项目不提供完整的多用户认证授权体系。

@@ -17,8 +17,12 @@ def collect_ob_cluster(cluster):
     pymysql = load_pymysql()
     conn = open_ob_connection(pymysql, cluster)
     try:
+        inventory = query_first(conn, ["select tenant_id, tenant_name as name from oceanbase.DBA_OB_TENANTS"])
+        authoritative = bool(inventory) and not any(r.get('_error') for r in inventory) and any(str(r.get('tenant_id')) == '1' and r.get('name') == 'sys' for r in inventory)
         return {
             "readonly": True,
+            "inventory_authoritative": authoritative,
+            "inventory_names": [r.get('name') for r in inventory if r.get('name') != 'sys'] if authoritative else [],
             "observers": query_first(conn, OBSERVER_QUERIES),
             "tenants": query_first(conn, TENANT_QUERIES),
             "tenant_backups": query_first(conn, TENANT_BACKUP_QUERIES),
@@ -737,3 +741,52 @@ PARAMETER_QUERIES = [
                    'datafile_size', 'memory_limit', 'cpu_count')
     """,
 ]
+
+
+def check_ob_major_compaction(cluster, now=None, deadline_hour=12):
+    """Check all SYS-visible tenant major compactions without changing OB.
+
+    'warning' means a confirmed error or an overdue new frozen SCN.
+    'unknown' means there was no verified freeze/completion today.
+    """
+    from datetime import datetime, time
+    now = now or datetime.now()
+    conn = open_ob_connection(load_pymysql(), cluster)
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''select tenant_id, frozen_scn, last_scn, frozen_time,
+                                  last_finish_time, status, is_error, is_suspended, info
+                           from oceanbase.CDB_OB_MAJOR_COMPACTION''')
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return {'status':'unknown','message':'合并视图未返回数据'}
+    errors, pending, completed, unverified = [], [], [], []
+    for row in rows:
+        tid = row.get('tenant_id')
+        if str(row.get('is_error','')).upper() == 'YES' or str(row.get('is_suspended','')).upper() == 'YES':
+            errors.append(f"{tid}({row.get('info') or row.get('status')})")
+            continue
+        try:
+            frozen = row.get('frozen_time')
+            finish = row.get('last_finish_time')
+            if isinstance(frozen,str): frozen=datetime.fromisoformat(frozen[:26])
+            if isinstance(finish,str): finish=datetime.fromisoformat(finish[:26])
+            if frozen and frozen <= now and int(row.get('frozen_scn') or 0)>int(row.get('last_scn') or 0):
+                pending.append(str(tid))
+            elif finish and finish.date()==now.date() and str(row.get('status','')).upper()=='IDLE':
+                completed.append(str(tid))
+        except (TypeError,ValueError):
+            unverified.append(str(tid))
+    if errors:
+        return {'status':'warning','message':'合并错误或暂停，租户ID：'+', '.join(errors[:12])}
+    if pending:
+        if now.time()>=time(deadline_hour):
+            return {'status':'warning','message':'已发起但未在截止时间前完成，租户ID：'+', '.join(pending[:12])}
+        return {'status':'pending','message':'合并正在进行/待完成，租户ID：'+', '.join(pending[:12])}
+    if completed and len(completed)==len(rows):
+        return {'status':'success','message':f'全部 {len(completed)} 个租户今日合并已完成'}
+    if completed:
+        return {'status':'unknown','message':f'今日已完成 {len(completed)}/{len(rows)} 个租户；其余未确认今日发生合并'}
+    return {'status':'unknown','message':'未发现今日新发起或完成的合并，未判定故障'}

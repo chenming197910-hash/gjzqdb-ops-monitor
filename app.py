@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import subprocess
 import zipfile
 from io import BytesIO
 from datetime import datetime
@@ -13,7 +15,8 @@ import oracledb
 from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from ob_collector import collect_ob_cluster, collect_ob_tenant_detail, probe_ob_cluster, probe_ob_tenant_connection
+from ob_collector import collect_ob_cluster, collect_ob_tenant_detail, probe_ob_cluster, probe_ob_tenant_connection, check_ob_major_compaction
+from cpu_history import run_cpu_sampling, cpu_history
 from ocp_collector import (
     OcpClient,
     normalize_ocp_clusters,
@@ -52,9 +55,9 @@ def config_value(config, key, env_name, default=""):
     return os.environ.get(env_name, default)
 
 
-ORACLE_USER = config_value(ORACLE_CONFIG, "user", "ORACLE_USER", "gjzqdbsys")
+ORACLE_USER = config_value(ORACLE_CONFIG, "user", "ORACLE_USER", "")
 ORACLE_PASSWORD = config_value(ORACLE_CONFIG, "password", "ORACLE_PASSWORD", "")
-ORACLE_DSN = config_value(ORACLE_CONFIG, "dsn", "ORACLE_DSN", "10.50.40.182:1521/gjzqdb")
+ORACLE_DSN = config_value(ORACLE_CONFIG, "dsn", "ORACLE_DSN", "")
 DEFAULT_OCP_VERSION = os.environ.get(
     "DEFAULT_OCP_VERSION",
     APP_CONFIG.get("default_ocp_version", "4.3.5-20250610160438"),
@@ -187,6 +190,49 @@ def create_app():
     def index():
         return render_template("index.html")
 
+    @app.route("/cpu-history")
+    def cpu_history_page():
+        return render_template("cpu_history.html")
+
+    @app.route("/api/cpu-history")
+    def cpu_history_api():
+        try:
+            days = int(request.args.get("days", "7"))
+            ids = list(dict.fromkeys(int(x) for x in request.args.get("tenants", "").split(",") if x.strip()))
+        except ValueError:
+            return jsonify({"error":"invalid tenant IDs or days"}),400
+        if days not in (7,14,30,60) or len(ids)>100 or any(x==0 for x in ids):
+            return jsonify({"error":"days must be 7,14,30,60; maximum 100 tenants"}),400
+        return jsonify(cpu_history(g.db, all_rows, ids, days))
+
+    @app.route("/api/cpu-history/tenants")
+    def cpu_history_tenants():
+        return jsonify(all_rows(g.db, """select q.* from (
+                 select t.id,t.cluster_id,t.name,t.active,c.name as cluster_name
+                 from tenants t join clusters c on c.id=t.cluster_id
+                 where t.active=1 and lower(t.name) <> 'sys'
+                 union all
+                 select -c.id as id,c.id as cluster_id,'sys' as name,1 as active,c.name as cluster_name
+                 from clusters c
+               ) q order by q.active desc,q.cluster_name,case when q.id<0 then 0 else 1 end,q.name"""))
+
+    @app.route("/api/cpu-history/status")
+    def cpu_sampling_status():
+        return jsonify(all_rows(g.db, """
+          select c.id,c.name as cluster_name,j.status,j.message,j.checked_at,
+                 x.last_sample_at,x.sample_count
+          from clusters c
+          left join cpu_collection_status j on j.cluster_id=c.id
+          left join (
+            select cluster_id,max(sampled_at) last_sample_at,count(*) sample_count from (
+              select t.cluster_id,s.sampled_at from tenant_cpu_samples s join tenants t on t.id=s.tenant_id
+              union all
+              select cluster_id,sampled_at from cluster_sys_cpu_samples
+            ) group by cluster_id
+          ) x on x.cluster_id=c.id
+          order by c.name
+        """))
+
     @app.route("/api/health")
     def health():
         return jsonify(
@@ -201,15 +247,24 @@ def create_app():
     @app.route("/api/summary")
     def summary():
         db = g.db
+        tenant_risks = tenant_risk_summary(db)
         return jsonify(
             {
                 "clusters": scalar(db, "select count(*) from clusters"),
-                "tenants": scalar(db, "select count(*) from tenants"),
+                "tenants": scalar(db, "select count(*) from tenants where active=1"),
                 "databases": scalar(db, "select count(*) from databases"),
                 "servers": scalar(db, "select count(*) from servers"),
                 "observers": scalar(db, "select count(*) from ob_servers"),
-                "log_errors": scalar(db, "select count(*) from ob_log_events where severity in ('ERROR', 'FATAL')"),
+                "log_errors": scalar(
+                    db,
+                    """
+                    select count(*) from ob_log_events
+                    where severity in ('ERROR', 'FATAL')
+                      and not regexp_like(message, '(^|[^[:alnum:]_])(INFO|TRACE|DEBUG|WDIAG|TDIAG|EDIAG|DIAG)([^[:alnum:]_]|$)', 'i')
+                    """,
+                ),
                 "ocp_connections": safe_scalar(db, "select count(*) from ocp_connections"),
+                **tenant_risks,
                 "sys_unhealthy": safe_scalar(
                     db,
                     """
@@ -254,7 +309,7 @@ def create_app():
                        count(distinct t.id) as tenant_count,
                        count(distinct o.id) as observer_count
                 from clusters c
-                left join tenants t on t.cluster_id = c.id
+                left join tenants t on t.cluster_id = c.id and t.active = 1
                 left join ob_servers o on o.cluster_id = c.id
                 left join cluster_collect_schedules s on s.cluster_id = c.id
                 group by c.id, c.name, c.environment, c.region, c.endpoint, c.port,
@@ -299,7 +354,7 @@ def create_app():
                            last_success_merge_time, last_merge_status,
                            status, created_at, updated_at
                     from tenants
-                    where cluster_id = :id
+                    where cluster_id = :id and active = 1
                     order by name
                     """,
                     {"id": cluster_id},
@@ -354,6 +409,9 @@ def create_app():
             request.args.get("hide_standby", "1") == "1",
             request.args.get("hide_meta", "1") == "1",
         )
+        risk = request.args.get('risk', '')
+        if risk in ('backup_overdue','merge_missing','collect_abnormal'):
+            rows = [row for row in rows if row.get(risk)]
         workbook = build_tenants_xlsx(rows)
         filename = f"ob-tenants-{local_now().strftime('%Y%m%d-%H%M%S')}.xlsx"
         return Response(
@@ -562,6 +620,8 @@ def create_app():
         tenant = get_tenant_with_cluster(g.db, tenant_id)
         if not tenant:
             return jsonify({"error": "tenant not found"}), 404
+        if tenant.get('active') != 1:
+            return jsonify({'error':'tenant inactive','message':'租户已停采，请先核验资产状态'}),409
         connection = one(g.db, "select * from tenant_connections where tenant_id = :tenant_id", {"tenant_id": tenant_id})
         if not connection or not connection.get("tenant_password"):
             return jsonify({"error": "tenant connection missing", "message": "请先保存租户采集账号和密码"}), 400
@@ -649,22 +709,9 @@ def create_app():
                 payload.get("server_ip", ""),
                 payload.get("log_path", ""),
             )
-            for event in events:
-                execute(
-                    g.db,
-                    """
-                    insert into ob_log_events
-                    (cluster_id, server_ip, log_path, event_time, severity, error_code,
-                     component, message, raw_line, created_at)
-                    values (:cluster_id, :server_ip, :log_path,
-                            to_timestamp(:event_time, 'YYYY-MM-DD HH24:MI:SS'),
-                            :severity, :error_code, :component, :message,
-                            :raw_line, systimestamp)
-                    """,
-                    event,
-                )
+            inserted = insert_ob_log_events(g.db, events)
             g.db.commit()
-            return jsonify({"inserted": len(events)}), 201
+            return jsonify({"inserted": inserted, "parsed": len(events)}), 201
 
         return jsonify(
             all_rows(
@@ -675,11 +722,58 @@ def create_app():
                        e.message, e.created_at
                 from ob_log_events e
                 left join clusters c on c.id = e.cluster_id
+                where not regexp_like(e.message, '(^|[^[:alnum:]_])(INFO|TRACE|DEBUG|WDIAG|TDIAG|EDIAG|DIAG)([^[:alnum:]_]|$)', 'i')
                 order by e.event_time desc, e.id desc
                 fetch first 100 rows only
                 """,
             )
         )
+
+    @app.route("/api/log-alerts")
+    def log_alerts():
+        return jsonify(
+            all_rows(
+                g.db,
+                """
+                select e.id, e.cluster_id, c.name as cluster_name, e.server_ip, e.log_path,
+                       e.event_time, e.severity, e.error_code, e.component,
+                       e.message, e.created_at
+                from ob_log_events e
+                left join clusters c on c.id = e.cluster_id
+                where e.severity in ('ERROR', 'FATAL', 'WARN')
+                  and not regexp_like(e.message, '(^|[^[:alnum:]_])(INFO|TRACE|DEBUG|WDIAG|TDIAG|EDIAG|DIAG)([^[:alnum:]_]|$)', 'i')
+                order by e.event_time desc, e.id desc
+                fetch first 10 rows only
+                """,
+            )
+        )
+
+    @app.route("/api/observer-log-sources", methods=["GET", "POST"])
+    def observer_log_sources():
+        if request.method == "POST":
+            payload = request.get_json(force=True)
+            missing = [key for key in ("cluster_id", "observer_ip", "ssh_user", "log_path") if not payload.get(key)]
+            if missing:
+                return jsonify({"error": "missing fields", "fields": missing}), 400
+            source_id = upsert_observer_log_source(g.db, payload)
+            g.db.commit()
+            return jsonify({"id": source_id}), 201
+        return jsonify(list_observer_log_sources(g.db))
+
+    @app.route("/api/observer-log-sources/<int:source_id>/collect", methods=["POST"])
+    def collect_observer_log_source_now(source_id):
+        source = get_observer_log_source(g.db, source_id)
+        if not source:
+            return jsonify({"error": "observer log source not found"}), 404
+        result = collect_observer_log_source(g.db, source)
+        g.db.commit()
+        return jsonify(result)
+
+    @app.route("/api/observer-log-sources/collect-all", methods=["POST"])
+    def collect_observer_log_sources_now():
+        result = collect_due_observer_log_sources(g.db, force=True)
+        g.db.commit()
+        return jsonify(result)
 
     @app.route("/api/collection-jobs")
     def collection_jobs():
@@ -692,17 +786,14 @@ def create_app():
                 from collection_jobs j
                 left join clusters c on c.id = j.cluster_id
                 order by j.started_at desc, j.id desc
-                fetch first 100 rows only
+                fetch first 10 rows only
                 """,
             )
         )
 
     @app.route("/api/sys-tenant-checks")
     def sys_tenant_checks():
-        try:
-            return jsonify(latest_sys_tenant_checks(g.db))
-        except oracledb.DatabaseError:
-            return jsonify([])
+        return jsonify(latest_sys_tenant_checks(g.db))
 
     @app.route("/api/sys-tenant-checks/run", methods=["POST"])
     def run_sys_tenant_checks_now():
@@ -866,43 +957,51 @@ def create_app():
         )
         if not cluster:
             return jsonify({"error": "cluster not found"}), 404
-        started = local_now()
-        try:
-            collected = collect_ob_cluster(cluster)
-        except RuntimeError as exc:
-            log_event(
-                logging.ERROR,
-                "ob_collect_failed",
-                cluster_id=cluster_id,
-                cluster_name=cluster["name"],
-                target=f"{cluster['endpoint']}:{cluster['port']}",
-                user=cluster["sys_user"],
-                error=str(exc),
-            )
-            message = generic_log_message("OB 只读采集")
-            record_collection_job(g.db, cluster_id, "ob_cluster", "failed", message, started)
-            g.db.commit()
-            return jsonify({"error": "collect failed", "message": message}), 400
-        except Exception as exc:
-            log_event(
-                logging.ERROR,
-                "ob_collect_unhandled_error",
-                cluster_id=cluster_id,
-                cluster_name=cluster["name"],
-                target=f"{cluster['endpoint']}:{cluster['port']}",
-                user=cluster["sys_user"],
-                error=str(exc),
-                exc_info=True,
-            )
-            message = generic_log_message("OB 只读采集")
-            record_collection_job(g.db, cluster_id, "ob_cluster", "failed", message, started)
-            g.db.commit()
-            return jsonify({"error": "collect failed", "message": message}), 502
-        stats = collect_cluster_assets(g.db, cluster_id, collected)
-        status = "warning" if stats.get("warnings") else "success"
-        record_collection_job(g.db, cluster_id, "ob_cluster", status, json.dumps(stats, ensure_ascii=False), started)
+        result = collect_one_cluster(g.db, cluster)
         g.db.commit()
-        return jsonify(stats)
+        if result["status"] == "failed":
+            return jsonify({"error": "collect failed", "message": result["message"]}), 400
+        return jsonify(result["stats"])
+
+    @app.route("/api/clusters/collect-all", methods=["POST"])
+    def collect_all_clusters():
+        clusters = all_rows(
+            g.db,
+            """
+            select id, name, endpoint, port, sys_user, sys_password
+            from clusters
+            order by environment, name
+            """,
+        )
+        summary = {
+            "total": len(clusters),
+            "success": 0,
+            "warning": 0,
+            "failed": 0,
+            "skipped": 0,
+            "results": [],
+        }
+        for cluster in clusters:
+            if not cluster.get("sys_password"):
+                started = local_now()
+                message = "未配置系统用户密码，已跳过"
+                record_collection_job(g.db, cluster["id"], "ob_cluster", "skipped", message, started)
+                summary["skipped"] += 1
+                summary["results"].append({"id": cluster["id"], "name": cluster["name"], "status": "skipped", "message": message})
+                continue
+            result = collect_one_cluster(g.db, cluster)
+            summary[result["status"]] = summary.get(result["status"], 0) + 1
+            summary["results"].append(
+                {
+                    "id": cluster["id"],
+                    "name": cluster["name"],
+                    "status": result["status"],
+                    "message": result["message"],
+                    "stats": result.get("stats", {}),
+                }
+            )
+        g.db.commit()
+        return jsonify(summary)
 
     @app.route("/api/clusters/<int:cluster_id>/probe", methods=["POST"])
     def probe_cluster(cluster_id):
@@ -1120,11 +1219,17 @@ def upsert_cluster(db, payload):
 
 
 def delete_cluster_local(db, cluster_id):
+    execute(db, "delete from cluster_sys_cpu_samples where cluster_id=:id", {"id":cluster_id})
     tenant_ids = [row["id"] for row in all_rows(db, "select id from tenants where cluster_id = :id", {"id": cluster_id})]
     for tenant_id in tenant_ids:
         delete_tenant_local(db, tenant_id)
     execute(db, "delete from ob_parameters where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from ob_log_events where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from observer_log_sources where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from sys_tenant_checks where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from cluster_merge_checks where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from tenant_cpu_counters where cluster_id = :id", {"id": cluster_id})
+    execute(db, "delete from cpu_collection_status where cluster_id=:id", {"id":cluster_id})
     execute(db, "delete from collection_jobs where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from cluster_collect_schedules where cluster_id = :id", {"id": cluster_id})
     execute(db, "delete from ob_servers where cluster_id = :id", {"id": cluster_id})
@@ -1133,13 +1238,54 @@ def delete_cluster_local(db, cluster_id):
 
 
 def delete_tenant_local(db, tenant_id):
+    execute(db, "delete from tenant_absence_checks where tenant_id=:id", {"id":tenant_id})
     execute(db, "delete from databases where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from tenant_collect_schedules where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from tenant_runtime_metrics where tenant_id = :id", {"id": tenant_id})
+    execute(db, "delete from tenant_cpu_samples where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from tenant_top_objects where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from tenant_connections where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from ob_parameters where tenant_id = :id", {"id": tenant_id})
     execute(db, "delete from tenants where id = :id", {"id": tenant_id})
+
+
+def collect_one_cluster(db, cluster):
+    cluster_id = cluster["id"]
+    started = local_now()
+    try:
+        collected = collect_ob_cluster(cluster)
+    except RuntimeError as exc:
+        log_event(
+            logging.ERROR,
+            "ob_collect_failed",
+            cluster_id=cluster_id,
+            cluster_name=cluster["name"],
+            target=f"{cluster['endpoint']}:{cluster['port']}",
+            user=cluster["sys_user"],
+            error=str(exc),
+        )
+        message = generic_log_message("OB 只读采集")
+        record_collection_job(db, cluster_id, "ob_cluster", "failed", message, started)
+        return {"status": "failed", "message": message, "stats": {}}
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            "ob_collect_unhandled_error",
+            cluster_id=cluster_id,
+            cluster_name=cluster["name"],
+            target=f"{cluster['endpoint']}:{cluster['port']}",
+            user=cluster["sys_user"],
+            error=str(exc),
+            exc_info=True,
+        )
+        message = generic_log_message("OB 只读采集")
+        record_collection_job(db, cluster_id, "ob_cluster", "failed", message, started)
+        return {"status": "failed", "message": message, "stats": {}}
+    stats = collect_cluster_assets(db, cluster_id, collected)
+    status = "warning" if stats.get("warnings") else "success"
+    message = json.dumps(stats, ensure_ascii=False)
+    record_collection_job(db, cluster_id, "ob_cluster", status, message, started)
+    return {"status": status, "message": message, "stats": stats}
 
 
 def record_collection_job(db, cluster_id, target_type, status, message, started):
@@ -1165,7 +1311,7 @@ def get_tenant_with_cluster(db, tenant_id):
     return one(
         db,
         """
-        select t.id, t.cluster_id, c.name as cluster_name, c.endpoint, c.port,
+        select t.id, t.cluster_id, t.active, c.name as cluster_name, c.endpoint, c.port,
                t.name, t.tenant_mode, t.primary_zone, t.locality, t.tenant_role,
                t.zone_resource_summary, t.unit_num, t.cpu_cores, t.memory_gb, t.last_full_backup_time,
                t.data_disk_used_gb, t.data_disk_total_gb, t.data_disk_usage_pct,
@@ -1284,7 +1430,7 @@ def upsert_tenant_schedule(db, tenant_id, payload):
 
 
 def list_tenants(db):
-    return all_rows(
+    rows = all_rows(
         db,
         """
         select t.id, t.cluster_id, c.name as cluster_name, t.name, t.tenant_mode,
@@ -1298,9 +1444,14 @@ def list_tenants(db):
                t.created_at, t.updated_at
         from tenants t
         left join clusters c on c.id = t.cluster_id
+        where t.active = 1
         order by c.name, t.name
         """,
     )
+    now = local_now()
+    for row in rows:
+        row.update(tenant_risk_flags(row, now))
+    return rows
 
 
 def filter_tenant_export_rows(rows, cluster_id, hide_standby, hide_meta):
@@ -1391,25 +1542,54 @@ def column_name(index):
 
 
 def latest_sys_tenant_checks(db):
-    return all_rows(
-        db,
-        """
+    # Optional extension must never hide the existing cluster health list.
+    available = scalar(db, "select count(*) from user_tables where table_name='CLUSTER_MERGE_CHECKS'")
+    if not available:
+        rows = all_rows(db, """
+          select c.id as cluster_id,c.name as cluster_name,c.endpoint,c.port,c.sys_user,
+                 case when c.sys_password is null then 0 else 1 end as has_password,
+                 x.status,x.message,x.checked_at
+          from clusters c left join (
+            select cluster_id,status,message,checked_at from (
+              select cluster_id,status,message,checked_at,
+                     row_number() over(partition by cluster_id order by checked_at desc,id desc) rn
+              from sys_tenant_checks
+            ) where rn=1
+          ) x on x.cluster_id=c.id order by c.name
+        """)
+        for row in rows:
+            row.update(merge_status='unknown', merge_message='合并检查表未迁移，请先完成测试环境迁移')
+        return rows
+    return all_rows(db, """
         select c.id as cluster_id, c.name as cluster_name, c.endpoint, c.port, c.sys_user,
                case when c.sys_password is null then 0 else 1 end as has_password,
-               x.status, x.message, x.checked_at
+               x.status, x.message, x.checked_at,
+               case when trunc(m.checked_at)=trunc(sysdate) then m.status else 'unknown' end as merge_status,
+               case when trunc(m.checked_at)=trunc(sysdate) then m.message else '今日尚未核验凌晨合并' end as merge_message,
+               m.checked_at as merge_checked_at
         from clusters c
         left join (
-            select cluster_id, status, message, checked_at
-            from (
-                select cluster_id, status, message, checked_at,
-                       row_number() over (partition by cluster_id order by checked_at desc, id desc) as rn
-                from sys_tenant_checks
-            )
-            where rn = 1
-        ) x on x.cluster_id = c.id
-        order by case when x.status = 'success' then 1 else 0 end, c.name
-        """,
-    )
+            select cluster_id,status,message,checked_at from (
+              select cluster_id,status,message,checked_at,
+                     row_number() over(partition by cluster_id order by checked_at desc,id desc) rn
+              from sys_tenant_checks
+            ) where rn=1
+        ) x on x.cluster_id=c.id
+        left join (
+            select cluster_id,status,message,checked_at from (
+              select cluster_id,status,message,checked_at,
+                     row_number() over(partition by cluster_id order by checked_at desc,id desc) rn
+              from cluster_merge_checks
+            ) where rn=1
+        ) m on m.cluster_id=c.id
+        order by case when x.status='success' and nvl(m.status,'unknown')!='warning' then 1 else 0 end,c.name
+    """)
+
+
+def record_merge_check(db, cluster_id, status, message):
+    execute(db, """insert into cluster_merge_checks(cluster_id,status,message,checked_at)
+                 values(:cid,:status,:message,systimestamp)""",
+            {'cid':cluster_id,'status':status,'message':str(message).encode('utf-8')[:1000].decode('utf-8', errors='ignore')})
 
 
 def run_sys_tenant_checks(db, force=False):
@@ -1444,22 +1624,25 @@ def run_sys_tenant_checks(db, force=False):
         try:
             result = probe_ob_cluster(cluster)
             record_sys_tenant_check(db, cluster["id"], "success", result.get("message", "sys 租户连接正常"))
-            stats["success"] += 1
         except Exception as exc:
             message = str(exc)[:1000]
             record_sys_tenant_check(db, cluster["id"], "failed", message)
-            log_event(
-                logging.ERROR,
-                "sys_tenant_check_failed",
-                cluster_id=cluster["id"],
-                cluster_name=cluster["name"],
-                target=f"{cluster.get('endpoint')}:{cluster.get('port')}",
-                user=cluster.get("sys_user"),
-                error=message,
-                exc_info=True,
-            )
-            stats["failed"] += 1
-        stats["checked"] += 1
+            log_event(logging.ERROR, "sys_tenant_check_failed", cluster_id=cluster['id'], error=message, exc_info=True)
+            stats['failed'] += 1
+            stats['checked'] += 1
+            continue
+        stats['success'] += 1
+        stats['checked'] += 1
+        # Optional compaction must not turn a successful connectivity check into failure.
+        try:
+            merge = check_ob_major_compaction(cluster, deadline_hour=int(APP_CONFIG.get("major_compaction_deadline_hour", 12)))
+            record_merge_check(db, cluster['id'], merge['status'], merge['message'])
+        except Exception as merge_exc:
+            log_event(logging.WARNING, 'major_compaction_check_failed', cluster_id=cluster['id'], error=str(merge_exc))
+            try:
+                record_merge_check(db, cluster['id'], 'unknown', '合并检查失败：'+str(merge_exc)[:250])
+            except oracledb.DatabaseError as persist_exc:
+                log_event(logging.WARNING, 'major_compaction_persist_failed', cluster_id=cluster['id'], error=str(persist_exc))
     return stats
 
 
@@ -1608,9 +1791,17 @@ def collect_cluster_assets(db, cluster_id, collected):
         stats["observers"] += 1
         stats["servers"] += 1
 
+    # An optional source query failure must not erase previously collected metrics.
+    metric_groups = {
+        'tenant_backups': ('last_full_backup_time',),
+        'tenant_disk_usage': ('data_disk_used_gb','data_disk_total_gb','data_disk_usage_pct','log_disk_used_gb','log_disk_total_gb','log_disk_usage_pct'),
+        'tenant_resources': ('unit_num','cpu_cores','memory_gb'),
+        'tenant_zone_resources': ('zone_resource_summary',),
+        'tenant_merges': ('last_success_merge_time','last_merge_status'),
+    }
+    preserve = [field for key,fields in metric_groups.items()
+                if any(row.get('_error') for row in collected.get(key,[])) for field in fields]
     tenant_id_by_source = {}
-    collected_tenant_names = set()
-    tenant_collect_failed = False
     backup_by_tenant = index_collected_rows(collected.get("tenant_backups", []), "tenant_id", "租户全备份", stats)
     disk_by_tenant = index_collected_rows(collected.get("tenant_disk_usage", []), "tenant_id", "租户磁盘", stats)
     resource_by_tenant = index_collected_rows(collected.get("tenant_resources", []), "tenant_id", "租户资源规格", stats)
@@ -1620,7 +1811,6 @@ def collect_cluster_assets(db, cluster_id, collected):
     for tenant in collected.get("tenants", []):
         if tenant.get("_error"):
             stats["warnings"].append(f"租户采集失败: {tenant['_error'][:300]}")
-            tenant_collect_failed = True
             continue
         source_tenant_id = str(tenant.get("tenant_id") or "")
         backup = backup_by_tenant.get(source_tenant_id, {})
@@ -1651,7 +1841,11 @@ def collect_cluster_assets(db, cluster_id, collected):
         }
         if not payload["name"]:
             continue
-        collected_tenant_names.add(payload["name"])
+        if preserve:
+            previous = one(db, 'select '+','.join(preserve)+' from tenants where cluster_id=:cid and name=:name',
+                           {'cid':cluster_id,'name':payload['name']})
+            if previous:
+                for field in preserve:payload[field]=previous.get(field)
         tenant_id = upsert_tenant(db, payload)
         tenant_id_by_source[source_tenant_id or payload["name"]] = tenant_id
         stats["tenants"] += 1
@@ -1665,8 +1859,9 @@ def collect_cluster_assets(db, cluster_id, collected):
             stats["tenant_zone_resources"] += 1
         if merge:
             stats["tenant_merges"] += 1
-    if not tenant_collect_failed and not collected_tenant_names:
-        stats["warnings"].append("本次未采集到任何租户，已保留该集群现有租户，避免误删")
+    from tenant_lifecycle import reconcile_tenants
+    stats.update(reconcile_tenants(db, cluster_id, collected, all_rows, one, execute, local_now()))
+
 
     parameter_collect_failed = any(param.get("_error") for param in collected.get("parameters", []))
     if not parameter_collect_failed:
@@ -1899,7 +2094,7 @@ def upsert_tenant(db, payload):
                 log_disk_usage_pct = :log_disk_usage_pct,
                 last_success_merge_time = :last_success_merge_time,
                 last_merge_status = :last_merge_status,
-                status = :status, updated_at = systimestamp
+                status = :status, active = 1, updated_at = systimestamp
             where id = :id
             """,
             {**payload, "id": existing["id"]},
@@ -2018,6 +2213,271 @@ def get_ocp_config(db, connection_id):
     )
 
 
+def tenant_risk_flags(row, now):
+    eligible = not (is_meta_tenant_row(row) or is_standby_tenant_row(row))
+    backup = parse_flexible_datetime(row.get('last_full_backup_time'))
+    status = str(row.get('status') or '').lower()
+    return {
+        'backup_overdue': eligible and (not backup or (now-backup).total_seconds() > 86400),
+        'merge_missing': eligible and not parse_flexible_datetime(row.get('last_success_merge_time')),
+        'collect_abnormal': eligible and bool(status) and status not in ('normal','online','running','available','active'),
+    }
+
+
+def tenant_risk_summary(db):
+    rows = list_tenants(db)
+    return {
+        'tenants_backup_overdue': sum(bool(r['backup_overdue']) for r in rows),
+        'tenants_merge_missing': sum(bool(r['merge_missing']) for r in rows),
+        'tenants_collect_abnormal': sum(bool(r['collect_abnormal']) for r in rows),
+    }
+
+
+def parse_flexible_datetime(value):
+    text = str(value or "").strip()[:19]
+    if not text or text == "-":
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text.replace("T", " "), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def is_meta_tenant_name(name):
+    text = str(name or "").lower()
+    return text.startswith("meta$") or "meta" in text
+
+
+def is_standby_tenant_row(row):
+    values = [row.get("tenant_role"), row.get("status"), row.get("name")]
+    return any("standby" in str(value or "").lower() for value in values)
+
+
+def list_observer_log_sources(db):
+    return all_rows(
+        db,
+        """
+        select s.id, s.cluster_id, c.name as cluster_name, s.observer_ip, s.ssh_user,
+               case when s.ssh_password is null then 0 else 1 end as has_password,
+               s.ssh_port, s.log_path, s.tail_lines, s.interval_minutes, s.enabled,
+               s.last_run_at, s.last_error, s.created_at, s.updated_at
+        from observer_log_sources s
+        left join clusters c on c.id = s.cluster_id
+        order by s.id desc
+        """,
+    )
+
+
+def get_observer_log_source(db, source_id):
+    return one(
+        db,
+        """
+        select s.id, s.cluster_id, c.name as cluster_name, s.observer_ip, s.ssh_user,
+               s.ssh_password, s.ssh_port, s.log_path, s.tail_lines, s.interval_minutes, s.enabled,
+               s.last_run_at, s.last_error, s.created_at, s.updated_at
+        from observer_log_sources s
+        left join clusters c on c.id = s.cluster_id
+        where s.id = :id
+        """,
+        {"id": source_id},
+    )
+
+
+def upsert_observer_log_source(db, payload):
+    data = {
+        "id": int(payload.get("id") or 0),
+        "cluster_id": int(payload["cluster_id"]),
+        "observer_ip": payload.get("observer_ip", ""),
+        "ssh_user": payload.get("ssh_user", "admin"),
+        "ssh_password": payload.get("ssh_password", ""),
+        "ssh_port": int(payload.get("ssh_port") or 22),
+        "log_path": payload.get("log_path", "/home/admin/oceanbase/log/observer.log"),
+        "tail_lines": int(payload.get("tail_lines") or 1000),
+        "interval_minutes": int(payload.get("interval_minutes") or 10),
+        "enabled": 1 if payload.get("enabled", True) else 0,
+    }
+    if data["id"]:
+        execute(
+            db,
+            """
+            update observer_log_sources
+            set cluster_id = :cluster_id, observer_ip = :observer_ip, ssh_user = :ssh_user,
+                ssh_password = case when :ssh_password is null or :ssh_password = ''
+                                    then ssh_password else :ssh_password end,
+                ssh_port = :ssh_port, log_path = :log_path, tail_lines = :tail_lines,
+                interval_minutes = :interval_minutes, enabled = :enabled,
+                updated_at = systimestamp
+            where id = :id
+            """,
+            data,
+        )
+        return data["id"]
+    return insert_returning_id(
+        db,
+        """
+        insert into observer_log_sources
+        (cluster_id, observer_ip, ssh_user, ssh_password, ssh_port, log_path, tail_lines,
+         interval_minutes, enabled, created_at, updated_at)
+        values (:cluster_id, :observer_ip, :ssh_user, :ssh_password, :ssh_port, :log_path, :tail_lines,
+                :interval_minutes, :enabled, systimestamp, systimestamp)
+        returning id into :id
+        """,
+        data,
+    )
+
+
+def collect_due_observer_log_sources(db, force=False):
+    sources = all_rows(db, "select * from observer_log_sources where enabled = 1 order by id")
+    summary = {"total": len(sources), "collected": 0, "skipped": 0, "failed": 0, "inserted": 0, "parsed": 0, "results": []}
+    now = local_now()
+    for source in sources:
+        if not force and not observer_log_source_due(source, now):
+            summary["skipped"] += 1
+            continue
+        result = collect_observer_log_source(db, source)
+        summary["collected"] += 1
+        summary["inserted"] += result.get("inserted", 0)
+        summary["parsed"] += result.get("parsed", 0)
+        if result.get("status") == "failed":
+            summary["failed"] += 1
+        summary["results"].append(result)
+    return summary
+
+
+def observer_log_source_due(source, now):
+    last_run = parse_db_timestamp(source.get("last_run_at"))
+    if not last_run:
+        return True
+    interval_minutes = int(source.get("interval_minutes") or 10)
+    return (now - last_run).total_seconds() >= interval_minutes * 60
+
+
+def parse_db_timestamp(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "")[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def collect_observer_log_source(db, source):
+    started = local_now()
+    try:
+        raw_log = read_observer_log_tail(source)
+        events = parse_ob_log(raw_log, source.get("cluster_id"), source.get("observer_ip", ""), source.get("log_path", ""))
+        inserted = insert_ob_log_events(db, events)
+        execute(
+            db,
+            """
+            update observer_log_sources
+            set last_run_at = systimestamp, last_error = null, updated_at = systimestamp
+            where id = :id
+            """,
+            {"id": source["id"]},
+        )
+        message = f"observer日志读取完成，解析{len(events)}条，新增{inserted}条"
+        record_collection_job(db, source.get("cluster_id"), "observer_log", "success", message, started)
+        return {"id": source["id"], "status": "success", "parsed": len(events), "inserted": inserted, "message": message}
+    except Exception as exc:
+        message = str(exc)[:1000]
+        execute(
+            db,
+            """
+            update observer_log_sources
+            set last_run_at = systimestamp, last_error = :last_error, updated_at = systimestamp
+            where id = :id
+            """,
+            {"id": source["id"], "last_error": message},
+        )
+        record_collection_job(db, source.get("cluster_id"), "observer_log", "failed", message, started)
+        log_event(logging.ERROR, "observer_log_collect_failed", source_id=source.get("id"), observer_ip=source.get("observer_ip"), error=message)
+        return {"id": source["id"], "status": "failed", "parsed": 0, "inserted": 0, "message": message}
+
+
+def read_observer_log_tail(source):
+    host = source.get("observer_ip") or ""
+    user = source.get("ssh_user") or "admin"
+    password = source.get("ssh_password") or ""
+    port = int(source.get("ssh_port") or 22)
+    log_path = source.get("log_path") or "/home/admin/oceanbase/log/observer.log"
+    tail_lines = int(source.get("tail_lines") or 1000)
+    remote = f"tail -n {tail_lines} {shlex.quote(log_path)}"
+    ssh_cmd = [
+        "ssh",
+        "-o",
+        f"BatchMode={'no' if password else 'yes'}",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-p",
+        str(port),
+        f"{user}@{host}",
+        remote,
+    ]
+    env = None
+    cmd = ssh_cmd
+    if password:
+        cmd = ["sshpass", "-e", *ssh_cmd]
+        env = {**os.environ, "SSHPASS": password}
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=45, env=env)
+    except FileNotFoundError as exc:
+        if password:
+            raise RuntimeError("服务器未安装 sshpass，无法使用页面配置的 SSH 密码读取日志；请安装 sshpass 或改用 SSH 免密") from exc
+        raise
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"SSH读取observer日志失败：{user}@{host}:{port} {log_path}；{detail[:500]}")
+    return result.stdout
+
+
+def insert_ob_log_events(db, events):
+    inserted = 0
+    for event in events:
+        if ob_log_event_exists(db, event):
+            continue
+        execute(
+            db,
+            """
+            insert into ob_log_events
+            (cluster_id, server_ip, log_path, event_time, severity, error_code,
+             component, message, raw_line, created_at)
+            values (:cluster_id, :server_ip, :log_path,
+                    to_timestamp(:event_time, 'YYYY-MM-DD HH24:MI:SS'),
+                    :severity, :error_code, :component, :message,
+                    :raw_line, systimestamp)
+            """,
+            event,
+        )
+        inserted += 1
+    return inserted
+
+
+def ob_log_event_exists(db, event):
+    return bool(
+        one(
+            db,
+            """
+            select id from ob_log_events
+            where nvl(cluster_id, -1) = nvl(:cluster_id, -1)
+              and nvl(server_ip, '-') = nvl(:server_ip, '-')
+              and event_time = to_timestamp(:event_time, 'YYYY-MM-DD HH24:MI:SS')
+              and severity = :severity
+              and message = :message
+              and rownum = 1
+            """,
+            event,
+        )
+    )
+
+
 def parse_ob_log(raw_log, cluster_id=None, server_ip="", log_path=""):
     events = []
     for line in raw_log.splitlines():
@@ -2041,6 +2501,9 @@ def parse_ob_log(raw_log, cluster_id=None, server_ip="", log_path=""):
 
 
 def detect_severity(line):
+    log_level = detect_ob_log_level(line)
+    if log_level in ("INFO", "TRACE", "DEBUG", "WDIAG", "TDIAG", "EDIAG", "DIAG"):
+        return None
     if re.search(r"\b(FATAL|CRITICAL)\b", line, re.IGNORECASE):
         return "FATAL"
     if re.search(r"\b(ERROR|ERR)\b", line, re.IGNORECASE):
@@ -2050,6 +2513,14 @@ def detect_severity(line):
     if re.search(r"OB-\d{4,}", line):
         return "ERROR"
     return None
+
+
+def detect_ob_log_level(line):
+    match = re.search(r"^\[[^\]]+\]\s+([A-Z]+)\b", line)
+    if match:
+        return match.group(1).upper()
+    match = re.search(r"\b(INFO|TRACE|DEBUG|WDIAG|TDIAG|EDIAG|DIAG|WARN|WARNING|ERROR|FATAL)\b", line, re.IGNORECASE)
+    return match.group(1).upper() if match else ""
 
 
 def parse_log_time(line):
@@ -2327,7 +2798,31 @@ DDL = [
     )
     """,
     """
+    create table observer_log_sources (
+        id number generated by default on null as identity primary key,
+        cluster_id number not null references clusters(id),
+        observer_ip varchar2(64) not null,
+        ssh_user varchar2(128) default 'admin' not null,
+        ssh_password varchar2(512),
+        ssh_port number default 22 not null,
+        log_path varchar2(512) default '/home/admin/oceanbase/log/observer.log' not null,
+        tail_lines number default 1000 not null,
+        interval_minutes number default 10 not null,
+        enabled number(1) default 1 not null,
+        last_run_at timestamp,
+        last_error varchar2(1000),
+        created_at timestamp not null,
+        updated_at timestamp not null
+    )
+    """,
+    """
+    alter table observer_log_sources add ssh_password varchar2(512)
+    """,
+    """
     alter table clusters add sys_password varchar2(512)
+    """,
+    """
+    alter table tenants add active number(1) default 1 not null
     """,
     """
     alter table tenants add locality varchar2(1000)
@@ -2374,6 +2869,72 @@ DDL = [
     """
     alter table ocp_connections add ocp_version varchar2(64) default '4.3.5-20250610160438'
     """,
+    """
+    create table cluster_merge_checks (
+      id number generated by default on null as identity primary key,
+      cluster_id number not null references clusters(id),
+      status varchar2(32) not null,
+      message varchar2(1000),
+      checked_at timestamp not null
+    )
+    """,
+    """
+    create table tenant_cpu_counters (
+      cluster_id number not null references clusters(id),
+      ob_tenant_id number not null,
+      svr_ip varchar2(64) not null,
+      svr_port number not null,
+      cpu_time_us number not null,
+      quota_hundredths number not null,
+      sampled_at timestamp not null,
+      constraint pk_tenant_cpu_counter primary key(cluster_id,ob_tenant_id,svr_ip,svr_port)
+    )
+    """,
+    """
+    create table tenant_cpu_samples (
+      id number generated by default on null as identity primary key,
+      tenant_id number not null references tenants(id),
+      sampled_at timestamp not null,
+      cpu_used_cores number,
+      cpu_limit_cores number,
+      cpu_used_pct number,
+      node_count number
+    )
+    """,
+    """
+    create index ix_tenant_cpu_samples on tenant_cpu_samples(tenant_id,sampled_at)
+    """,
+    """
+    create table tenant_absence_checks (
+      tenant_id number primary key references tenants(id),
+      cluster_id number not null references clusters(id),
+      first_missing_at timestamp not null
+    )
+    """,
+    """
+    create table cpu_collection_status (
+      cluster_id number primary key references clusters(id),
+      status varchar2(32) not null,
+      message varchar2(1000),
+      checked_at timestamp not null
+    )
+    """,
+
+    """
+    create table cluster_sys_cpu_samples (
+      id number generated by default on null as identity primary key,
+      cluster_id number not null references clusters(id),
+      sampled_at timestamp not null,
+      cpu_used_cores number,
+      cpu_limit_cores number,
+      cpu_used_pct number,
+      node_count number
+    )
+    """,
+    """
+    create index ix_sys_cpu_samples on cluster_sys_cpu_samples(cluster_id,sampled_at)
+    """,
+
 ]
 
 

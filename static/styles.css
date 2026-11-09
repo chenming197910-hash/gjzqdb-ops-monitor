@@ -126,7 +126,7 @@ button:hover {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(7, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 12px;
   margin-bottom: 18px;
 }
@@ -145,6 +145,16 @@ button:hover {
 .metric-card.clickable:hover {
   border-color: #82b2ea;
   box-shadow: 0 6px 18px rgba(35, 104, 179, 0.12);
+}
+
+.metric-card.metric-risk {
+  border-color: #f0b8c0;
+  background: #fff7f7;
+}
+
+.metric-card.metric-risk span,
+.metric-card.metric-risk strong {
+  color: #c62828;
 }
 
 .metric-card span {
@@ -699,3 +709,6 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+.cpu-history-link {display:inline-block;margin-left:20px;padding:8px 14px;border:1px solid #b7cbe6;border-radius:6px;text-decoration:none;font-size:14px;font-weight:500;color:#225ea8;background:#f3f7fd}
+.health-row-bad td {background:#fff0f0!important;color:#991b1b}

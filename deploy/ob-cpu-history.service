@@ -1,0 +1,10 @@
+[Unit]
+Description=OceanBase CPU history sampling (read-only OB access)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gjzqdb
+ExecStart=/root/gjzqdb/.venv/bin/python /root/gjzqdb/run_cpu_collector.py
+Environment=TZ=Asia/Shanghai
+TimeoutStartSec=240

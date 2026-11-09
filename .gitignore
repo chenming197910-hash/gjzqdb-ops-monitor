@@ -12,3 +12,16 @@ data/
 htmlcov/
 .DS_Store
 Thumbs.db
+
+# Local credentials, scheduler locks and deployment artifacts
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.scheduler.lock
+*.zip
+*.tar.gz
+work/
+outputs/
+snapshots/

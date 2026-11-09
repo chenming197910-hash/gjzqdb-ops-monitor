@@ -11,10 +11,12 @@ from app import (
     one,
     record_collection_job,
     run_sys_tenant_checks,
+    run_cpu_sampling,
     store_tenant_detail,
     all_rows,
     build_tenant_collect_user,
     build_tenant_service_name,
+    collect_due_observer_log_sources,
     execute,
     log_event,
 )
@@ -80,7 +82,7 @@ def collect_one(db, schedule):
     tenant_id = schedule["tenant_id"]
     tenant = get_tenant_with_cluster(db, tenant_id)
     connection = one(db, "select * from tenant_connections where tenant_id = :tenant_id", {"tenant_id": tenant_id})
-    if not tenant or not connection or not connection.get("tenant_password"):
+    if not tenant or tenant.get("active", 1) != 1 or not connection or not connection.get("tenant_password"):
         return
     started = local_now()
     try:
@@ -120,22 +122,43 @@ def collect_one(db, schedule):
     )
 
 
-def main():
-    db = get_pool().acquire()
+def isolated(db, label, callback):
     try:
-        now = datetime.now()
-        cluster_schedules = all_rows(db, "select * from cluster_collect_schedules where enabled = 1")
-        for schedule in cluster_schedules:
-            if schedule_due({**schedule, "frequency": "daily"}, now):
-                collect_one_cluster(db, schedule)
-        schedules = all_rows(db, "select * from tenant_collect_schedules where enabled = 1")
-        for schedule in schedules:
-            if schedule_due(schedule, now):
-                collect_one(db, schedule)
-        run_sys_tenant_checks(db, force=False)
+        callback()
         db.commit()
-    finally:
-        db.close()
+    except Exception as exc:
+        db.rollback()
+        log_event(logging.ERROR, 'scheduler_task_failed', task=label, error=str(exc), exc_info=True)
+
+
+def main():
+    # Single host exclusion; CPU sampling also locks each cluster in Oracle.
+    import fcntl
+    from pathlib import Path
+    lock_path = Path(__file__).resolve().parent / '.scheduler.lock'
+    with lock_path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        db = get_pool().acquire()
+        try:
+            now = datetime.now()
+            isolated(db, 'cpu', lambda: run_cpu_sampling(db, all_rows, one, execute, log_event))
+            cluster_schedules = all_rows(db, "select * from cluster_collect_schedules where enabled = 1")
+            for schedule in cluster_schedules:
+                if schedule_due({**schedule, "frequency": "daily"}, now):
+                    isolated(db, 'cluster', lambda: collect_one_cluster(db, schedule))
+            schedules = all_rows(db, """select s.* from tenant_collect_schedules s
+                         join tenants t on t.id=s.tenant_id
+                         where s.enabled=1 and t.active=1""")
+            for schedule in schedules:
+                if schedule_due(schedule, now):
+                    isolated(db, 'tenant', lambda: collect_one(db, schedule))
+            from hourly_collection import collect_homepage
+            isolated(db, 'homepage_hourly', lambda: collect_homepage(db))
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

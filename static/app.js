@@ -5,7 +5,9 @@ const state = {
   tenants: [],
   servers: [],
   logs: [],
+  topAlerts: [],
   jobs: [],
+  observerLogSources: [],
   sysChecks: [],
 };
 
@@ -21,7 +23,10 @@ const els = {
   tenantRows: document.querySelector("#tenantRows"),
   serverRows: document.querySelector("#serverRows"),
   logRows: document.querySelector("#logRows"),
+  topAlertRows: document.querySelector("#topAlertRows"),
   jobRows: document.querySelector("#jobRows"),
+  observerLogClusterSelect: document.querySelector("#observerLogClusterSelect"),
+  observerLogSourceRows: document.querySelector("#observerLogSourceRows"),
   sysHealthRows: document.querySelector("#sysHealthRows"),
   ocpRows: document.querySelector("#ocpRows"),
   tenantClusterFilter: document.querySelector("#tenantClusterFilter"),
@@ -49,55 +54,42 @@ async function api(path, options = {}) {
 }
 
 async function loadAll() {
-  try {
-    const [health, summary, clusters, tenants, servers, logs, jobs, sysChecks, ocps] = await Promise.all([
-      api("/api/health"),
-      api("/api/summary"),
-      api("/api/clusters"),
-      api("/api/tenants"),
-      api("/api/servers"),
-      api("/api/logs"),
-      api("/api/collection-jobs"),
-      api("/api/sys-tenant-checks"),
-      api("/api/ocp/connections"),
-    ]);
-    state.clusters = clusters;
-    state.tenants = tenants;
-    state.servers = servers;
-    state.logs = logs;
-    state.jobs = jobs;
-    state.sysChecks = sysChecks;
-    state.ocpConnections = ocps;
-    els.dbInfo.textContent = `后台 Oracle 资产库已连接（${health.oracle_user}）`;
-    setStatus("");
-    renderSummary(summary);
-    renderTenantClusterFilter(clusters);
-    renderTenantResourceCharts(tenants);
-    renderClusters(clusters);
-    renderTenants(tenants);
-    renderServers(servers);
-    renderLogs(logs);
-    renderJobs(jobs);
-    renderSysHealth(sysChecks);
-    renderOcpConnections(ocps);
-  } catch (error) {
-    els.dbInfo.textContent = "数据库连接异常";
-    setStatus(`数据库未连接或资产表未初始化：${error.message}`);
-    renderSummary({});
-    renderTenantClusterFilter([]);
-    renderTenantResourceCharts([]);
-    renderClusters([]);
-    renderTenants([]);
-    renderServers([]);
-    renderLogs([]);
-    renderJobs([]);
-    renderSysHealth([]);
-    renderOcpConnections([]);
-  }
+  const tasks = [
+    ["/api/health", null, health => { els.dbInfo.textContent = `后台 Oracle 资产库已连接（${health.oracle_user}）`; }],
+    ["/api/summary", null, renderSummary],
+    ["/api/clusters", "clusters", rows => {renderTenantClusterFilter(rows); renderClusters(rows);}],
+    ["/api/tenants", "tenants", rows => {renderTenantResourceCharts(rows); renderTenants(rows);}],
+    ["/api/servers", "servers", renderServers],
+    ["/api/logs", "logs", renderLogs],
+    ["/api/log-alerts", "topAlerts", renderTopAlerts],
+    ["/api/collection-jobs", "jobs", renderJobs],
+    ["/api/sys-tenant-checks", "sysChecks", renderSysHealth],
+    ["/api/ocp/connections", "ocpConnections", renderOcpConnections],
+    ["/api/observer-log-sources", "observerLogSources", renderObserverLogSources],
+  ];
+  const results = await Promise.allSettled(tasks.map(([path]) => api(path)));
+  const errors = [];
+  results.forEach((result, index) => {
+    const [path, key, render] = tasks[index];
+    if (result.status === "fulfilled") {
+      if (key) state[key] = result.value;
+      try { render(result.value); } catch (error) { errors.push(`${path} 显示失败：${error.message}`); }
+    } else {
+      errors.push(`${path}：${result.reason.message}`);
+      if (path === "/api/sys-tenant-checks") {
+        if (!state.sysChecks.length) els.sysHealthRows.innerHTML = emptyRow(7, "健康数据读取失败，请查看上方错误信息；不能判定为暂无集群。");
+      }
+      if (path === "/api/health") els.dbInfo.textContent = "连接状态检查失败";
+    }
+  });
+  setStatus(errors.length ? `部分数据读取失败；保留已显示数据（可能已过期）。${errors.join("；")}` : "");
 }
 
 function renderSummary(summary) {
   const cards = [
+    ["24小时未备份", summary.tenants_backup_overdue || 0, "tenantsSection", "risk"],
+    ["未成功合并", summary.tenants_merge_missing || 0, "tenantsSection", "risk"],
+    ["采集异常租户", summary.tenants_collect_abnormal || 0, "tenantsSection", "risk"],
     ["OB集群", summary.clusters || 0, "clustersSection"],
     ["租户", summary.tenants || 0, "tenantsSection"],
     ["数据库", summary.databases || 0, "tenantsSection"],
@@ -107,14 +99,24 @@ function renderSummary(summary) {
     ["采集任务", state.jobs.length || 0, "jobsSection"],
     ["OCP接入", summary.ocp_connections || 0, "configsSection"],
   ];
-  els.summaryCards.innerHTML = cards.map(([label, value, target]) => `
-    <article class="metric-card clickable" data-target="${target}">
+  els.summaryCards.innerHTML = cards.map(([label, value, target, tone], index) => `
+    <article class="metric-card clickable ${tone === "risk" && Number(value || 0) > 0 ? "metric-risk" : ""}" data-target="${target}" data-risk="${['backup_overdue','merge_missing','collect_abnormal'][index] || ''}">
       <span>${label}</span>
       <strong>${value}</strong>
     </article>
   `).join("");
   document.querySelectorAll("[data-target]").forEach((card) => {
-    card.addEventListener("click", () => scrollToSection(card.dataset.target));
+    card.addEventListener("click", () => {
+      if (card.dataset.target === "tenantsSection") {
+        state.riskFilter = card.dataset.risk || "";
+        els.tenantClusterFilter.value = "";
+        els.hideStandbyTenants.checked = false;
+        els.hideMetaTenants.checked = false;
+        updateTenantFilterStates();
+        renderTenants(state.tenants);
+      }
+      scrollToSection(card.dataset.target);
+    });
   });
 }
 
@@ -198,6 +200,7 @@ function formatPercent(value, total) {
 }
 
 function renderClusters(rows) {
+  renderObserverLogClusterOptions(rows);
   els.clusterRows.innerHTML = rows.length ? rows.map((item) => `
     <tr>
       <td>${safe(item.id)}</td>
@@ -258,6 +261,17 @@ function renderClusters(rows) {
   });
 }
 
+function renderObserverLogClusterOptions(rows) {
+  if (!els.observerLogClusterSelect) return;
+  const current = els.observerLogClusterSelect.value;
+  els.observerLogClusterSelect.innerHTML = rows.length
+    ? rows.map((item) => `<option value="${safe(item.id)}">${safe(item.name)} (${safe(item.endpoint || "-")})</option>`).join("")
+    : `<option value="">暂无集群</option>`;
+  if ([...els.observerLogClusterSelect.options].some((option) => option.value === current)) {
+    els.observerLogClusterSelect.value = current;
+  }
+}
+
 function clusterScheduleText(item) {
   if (Number(item.schedule_enabled || 0) !== 1) return "-";
   const lastRun = item.schedule_last_run_at ? `<br><small>上次 ${safe(item.schedule_last_run_at)}</small>` : "";
@@ -266,6 +280,8 @@ function clusterScheduleText(item) {
 
 function renderTenants(rows) {
   const filteredRows = filterTenants(rows);
+  const info = document.querySelector('#tenantFilterInfo');
+  if (info) info.textContent = `当前显示 ${filteredRows.length} / ${rows.length} 个有效租户${state.riskFilter ? ' · 已按风险卡片筛选（清除可查看全部）' : ''}`;
   els.tenantRows.innerHTML = filteredRows.length ? filteredRows.map((item) => `
     <tr class="${tenantRowClass(item)}">
       <td>${safe(item.id)}</td>
@@ -275,7 +291,7 @@ function renderTenants(rows) {
       <td class="message-cell">${primaryZoneCell(item)}</td>
       <td><span class="${tenantRoleClass(item)}">${safe(item.tenant_role || "-")}</span></td>
       <td>${safe(item.unit_num)}</td>
-      <td>${backupTimeCell(item.last_full_backup_time)}</td>
+      <td>${backupTimeCell(item.last_full_backup_time, item.backup_overdue)}</td>
       <td>${usageText(item.data_disk_used_gb, item.data_disk_total_gb, item.data_disk_usage_pct)}</td>
       <td>${usageText(item.log_disk_used_gb, item.log_disk_total_gb, item.log_disk_usage_pct)}</td>
       <td>${safe(item.last_success_merge_time || "-")}${item.last_merge_status ? `<br><small>${safe(item.last_merge_status)}</small>` : ""}</td>
@@ -299,6 +315,7 @@ function renderTenantClusterFilter(clusters) {
 
 function filterTenants(rows) {
   return rows.filter((item) => {
+    if (state.riskFilter && !item[state.riskFilter]) return false;
     if (els.tenantClusterFilter.value && String(item.cluster_id) !== els.tenantClusterFilter.value) return false;
     if (els.hideStandbyTenants.checked && isStandbyTenant(item)) return false;
     if (els.hideMetaTenants.checked && isMetaTenant(item)) return false;
@@ -313,23 +330,14 @@ function isStandbyTenant(item) {
 
 function isMetaTenant(item) {
   const name = String(item.name || "").toLowerCase();
-  return name.startsWith("meta$") || name.includes("meta");
+  return name.startsWith("meta$");
 }
 
-function backupTimeCell(value) {
-  if (!value) return "-";
-  if (!isBackupOverdue(value)) return safe(value);
-  return `<span class="backup-overdue">${safe(value)}<br><small>超过24小时未全备</small></span>`;
+function backupTimeCell(value, overdue) {
+  if (overdue) return `<span class="backup-overdue">${safe(value || "未取得成功全备记录")}<br><small>24小时未取得成功全备</small></span>`;
+  return safe(value || "-");
 }
 
-function isBackupOverdue(value) {
-  const now = new Date();
-  const day = now.getDay();
-  if (day === 0 || day === 6) return false;
-  const backupTime = parseLocalDateTime(value);
-  if (!backupTime) return false;
-  return now.getTime() - backupTime.getTime() > 24 * 60 * 60 * 1000;
-}
 
 function parseLocalDateTime(value) {
   const text = String(value || "").trim();
@@ -400,13 +408,43 @@ function renderLogs(rows) {
   `).join("") : emptyRow(7, "暂无日志事件。");
 }
 
+function renderTopAlerts(rows) {
+  els.topAlertRows.innerHTML = rows.length ? rows.map((item) => `
+    <tr class="${item.severity === "FATAL" || item.severity === "ERROR" ? "health-row-bad" : ""}">
+      <td>${safe(item.event_time || item.created_at)}</td>
+      <td>${badge(item.severity)}</td>
+      <td>${safe(item.cluster_name || item.cluster_id)}</td>
+      <td>${safe(item.server_ip)}</td>
+      <td>${safe(item.error_code)}</td>
+      <td class="message-cell" title="${safe(item.message)}">${safe(item.message)}</td>
+    </tr>
+  `).join("") : emptyRow(6, "暂无 OB 日志告警。配置日志源后会在这里显示最近事件。");
+}
+
+function renderObserverLogSources(rows) {
+  if (!els.observerLogSourceRows) return;
+  els.observerLogSourceRows.innerHTML = rows.length ? rows.map((item) => `
+    <tr class="${item.last_error ? "health-row-bad" : ""}">
+      <td>${safe(item.cluster_name || item.cluster_id)}</td>
+      <td>${safe(item.observer_ip)}:${safe(item.ssh_port || 22)}</td>
+      <td>${safe(item.ssh_user)}</td>
+      <td class="message-cell" title="${safe(item.log_path)}">${safe(item.log_path)}</td>
+      <td>${safe(item.tail_lines)}</td>
+      <td>${safe(item.interval_minutes)}分钟</td>
+      <td>${Number(item.enabled || 0) === 1 ? "是" : "否"}</td>
+      <td>${safe(item.last_run_at || "-")}</td>
+      <td class="message-cell" title="${safe(item.last_error || "")}">${safe(item.last_error || "-")}</td>
+    </tr>
+  `).join("") : emptyRow(9, "暂无日志源配置。保存一台 observer 后会显示在这里。");
+}
+
 function renderJobs(rows) {
   els.jobRows.innerHTML = rows.length ? rows.map((item) => `
     <tr>
       <td>${safe(item.id)}</td>
       <td>${safe(item.started_at)}</td>
       <td>${safe(item.cluster_name || item.cluster_id || "-")}</td>
-      <td>${safe(item.target_type)}</td>
+      <td>${safe(({homepage_sys_hourly:"每小时 SYS 健康检查",homepage_assets_hourly:"每小时集群/租户信息",homepage_logs_hourly:"每小时日志读取"})[item.target_type] || item.target_type)}</td>
       <td>${badge(item.status)}</td>
       <td class="message-cell" title="${safe(item.message)}">${safe(item.message)}</td>
     </tr>
@@ -415,15 +453,16 @@ function renderJobs(rows) {
 
 function renderSysHealth(rows) {
   els.sysHealthRows.innerHTML = rows.length ? rows.map((item) => `
-    <tr class="${item.status && item.status !== "success" ? "health-row-bad" : ""}">
+    <tr class="${(item.status && item.status !== "success") || item.merge_status === "warning" ? "health-row-bad" : ""}">
       <td>${safe(item.cluster_name)}</td>
       <td>${safe(item.endpoint)}:${safe(item.port)}</td>
       <td>${safe(item.sys_user)}</td>
       <td>${badge(item.status || (Number(item.has_password || 0) ? "unchecked" : "failed"))}</td>
+      <td title="${safe(item.merge_message || "")}">${safe(({success:"正常",warning:"异常",pending:"等待完成",unknown:"未确认"})[item.merge_status] || "未确认")}<br><small>${safe(item.merge_message || "尚未检查")}</small></td>
       <td>${safe(item.checked_at || "-")}</td>
       <td class="message-cell" title="${safe(item.message || "")}">${safe(item.message || (Number(item.has_password || 0) ? "尚未检查" : "未配置密码"))}</td>
     </tr>
-  `).join("") : emptyRow(6, "暂无集群。");
+  `).join("") : emptyRow(7, "暂无集群。");
 }
 
 function renderOcpConnections(rows) {
@@ -487,7 +526,8 @@ function formToPayload(form) {
   const payload = Object.fromEntries(new FormData(form).entries());
   if (payload.cluster_id === "") delete payload.cluster_id;
   if (form.id === "ocpForm") payload.verify_ssl = Boolean(form.elements.verify_ssl.checked);
-  for (const key of ["port", "cpu_cores", "memory_gb", "disk_gb", "ssh_port"]) {
+  if (form.id === "observerLogSourceForm") payload.enabled = Boolean(form.elements.enabled.checked);
+  for (const key of ["port", "cpu_cores", "memory_gb", "disk_gb", "ssh_port", "tail_lines", "interval_minutes"]) {
     if (payload[key] !== undefined) payload[key] = Number(payload[key] || 0);
   }
   return payload;
@@ -606,6 +646,25 @@ document.querySelector("#syncOcp").addEventListener("click", async () => {
   }
 });
 
+document.querySelector("#collectAllClusters").addEventListener("click", collectAllClusters);
+
+document.querySelectorAll("[data-collect-observer-logs]").forEach((button) => {
+  button.addEventListener("click", collectObserverLogs);
+});
+
+async function collectObserverLogs() {
+  try {
+    showToast("正在读取 observer 日志...");
+    const result = await api("/api/observer-log-sources/collect-all", { method: "POST", body: "{}" });
+    showToast(`日志读取完成：来源${result.collected || 0}，解析${result.parsed || 0}，新增${result.inserted || 0}，失败${result.failed || 0}`);
+    await loadAll();
+    scrollToSection("topAlertsSection");
+  } catch (error) {
+    showToast(error.message);
+    setStatus(`日志读取失败：${error.message}`);
+  }
+}
+
 function syncOcpConnection(connectionId, confirmDuplicateDatabases) {
   return api(`/api/ocp/connections/${connectionId}/sync`, {
     method: "POST",
@@ -616,6 +675,7 @@ function syncOcpConnection(connectionId, confirmDuplicateDatabases) {
 function exportTenantExcel() {
   const params = new URLSearchParams({
     cluster_id: els.tenantClusterFilter.value || "",
+    risk: state.riskFilter || "",
     hide_standby: els.hideStandbyTenants.checked ? "1" : "0",
     hide_meta: els.hideMetaTenants.checked ? "1" : "0",
   });
@@ -634,6 +694,25 @@ async function collectCluster(clusterId) {
   } catch (error) {
     showToast(error.message);
     setStatus(`只读采集失败：${error.message}`);
+    await loadAll();
+    scrollToSection("jobsSection");
+  }
+}
+
+async function collectAllClusters() {
+  try {
+    showToast("正在一键收集所有已配置密码的 OB 集群...");
+    const result = await api("/api/clusters/collect-all", { method: "POST", body: "{}" });
+    showToast(`一键收集完成：成功${result.success || 0}，警告${result.warning || 0}，失败${result.failed || 0}，跳过${result.skipped || 0}`);
+    const failed = (result.results || []).filter((item) => item.status === "failed").slice(0, 5);
+    if (failed.length) {
+      setStatus(`失败集群：${failed.map((item) => item.name).join("，")}`);
+    }
+    await loadAll();
+    scrollToSection("jobsSection");
+  } catch (error) {
+    showToast(error.message);
+    setStatus(`一键收集失败：${error.message}`);
     await loadAll();
     scrollToSection("jobsSection");
   }
@@ -1135,6 +1214,26 @@ document.querySelector("#clusterScheduleForm").addEventListener("submit", async 
   }
 });
 
+document.querySelector("#observerLogSourceForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/observer-log-sources", { method: "POST", body: JSON.stringify(formToPayload(event.currentTarget)) });
+    showToast("observer 日志源已保存");
+    closeModal("observerLogSourceModal");
+    event.currentTarget.reset();
+    event.currentTarget.elements.ssh_user.value = "admin";
+    event.currentTarget.elements.ssh_password.value = "";
+    event.currentTarget.elements.ssh_port.value = 22;
+    event.currentTarget.elements.log_path.value = "/home/admin/oceanbase/log/observer.log";
+    event.currentTarget.elements.tail_lines.value = 1000;
+    event.currentTarget.elements.interval_minutes.value = 10;
+    event.currentTarget.elements.enabled.checked = true;
+    await loadAll();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
 document.querySelector("#ocpForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -1194,6 +1293,9 @@ els.tenantClusterFilter.addEventListener("change", () => {
   renderTenants(state.tenants);
 });
 els.exportTenants.addEventListener("click", exportTenantExcel);
+ document.querySelector('#clearTenantRisk').addEventListener('click', () => {
+   state.riskFilter = ''; renderTenants(state.tenants);
+ });
 
 updateTenantFilterStates();
 loadAll();
