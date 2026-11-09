@@ -271,7 +271,7 @@ def inspection_passwords(profile):
 def scoped_tenants(db, profile):
     tenants=api().all_rows(db,'''select t.id,t.name,t.active,t.tenant_mode,t.cluster_id,c.name as cluster_name,c.endpoint,c.port
       from tenants t join clusters c on c.id=t.cluster_id where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL')
-      and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' order by c.name,t.name''')
+      and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' and nvl(upper(t.tenant_role),'UNKNOWN') not like '%STANDBY%' order by c.name,t.name''')
     scope=parse_json(profile.get('cluster_ids_json'),[])
     return [tenant for tenant in tenants if not scope or tenant['cluster_id'] in scope]
 
@@ -442,7 +442,7 @@ def register_routes(flask_app):
            from tenants t join clusters c on c.id=t.cluster_id
            left join (select x.*,row_number() over(partition by tenant_id order by run_day desc,id desc) rn from tenant_inspection_runs x) r
              on r.tenant_id=t.id and r.rn=1
-           where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL') and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%'
+           where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL') and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' and nvl(upper(t.tenant_role),'UNKNOWN') not like '%STANDBY%'
            order by c.name,t.name''')
         scope=parse_json(config(g.db).get('cluster_ids_json'),[])
         if scope:

@@ -187,6 +187,25 @@ def create_app():
         if db is not None:
             db.close()
 
+    @app.route("/asset-management")
+    def asset_management():
+        from ob_assets import asset_directory
+        try:
+            with get_pool().acquire() as db:
+                rows = all_rows(db, """
+                    select c.name as cluster_name, t.name as tenant_name,
+                           t.tenant_mode, t.tenant_role
+                    from tenants t join clusters c on c.id = t.cluster_id
+                    where t.active = 1
+                      and lower(t.name) <> 'sys' and lower(t.name) not like 'meta$%'
+                    order by c.name, lower(t.name), t.id
+                """)
+            error = False
+        except oracledb.Error:
+            log_event(logging.WARNING, "asset_management_inventory_unavailable")
+            rows, error = [], True
+        return render_template("asset_management.html", clusters=asset_directory(rows, CONFIG.get("ob_assets", [])), asset_error=error)
+
     @app.route("/")
     def index():
         return render_template("index.html")
@@ -295,8 +314,7 @@ def create_app():
             g.db.commit()
             return jsonify({"id": new_id}), 201
 
-        return jsonify(
-            all_rows(
+        rows = all_rows(
                 g.db,
                 """
                 select c.id, c.name, c.environment, c.region, c.endpoint, c.port,
@@ -319,8 +337,33 @@ def create_app():
                          c.created_at, c.updated_at
                 order by c.environment, c.name
                 """,
-            )
         )
+        totals = {row["cluster_id"]: row for row in all_rows(g.db, """
+            select t.cluster_id, count(*) as primary_tenant_count,
+                   count(r.current_processes) as primary_connection_sample_count,
+                   sum(r.current_processes) as primary_connections,
+                   min(r.collected_at) as primary_connections_oldest_at,
+                   max(r.collected_at) as primary_connections_latest_at
+            from tenants t
+            left join (
+                select m.*, row_number() over (
+                    partition by tenant_id order by collected_at desc, id desc
+                ) as rn
+                from tenant_runtime_metrics m
+                where current_processes is not null
+            ) r on r.tenant_id = t.id and r.rn = 1
+            where t.active = 1 and upper(t.tenant_role) = 'PRIMARY'
+              and lower(t.name) <> 'sys' and lower(t.name) not like 'meta$%'
+            group by t.cluster_id
+        """)}
+        from odp_connections import read_snapshot
+        snapshot = read_snapshot(BASE_DIR / "data")
+        for row in rows:
+            row.update(totals.get(row["id"], {}))
+            odp = snapshot.get("clusters", {}).get(row["name"].casefold())
+            if odp:
+                row["odp_connections"] = dict(odp, sampled_at=snapshot.get("sampled_at"))
+        return jsonify(rows)
 
     @app.route("/api/clusters/<int:cluster_id>", methods=["GET", "DELETE"])
     def cluster_detail(cluster_id):

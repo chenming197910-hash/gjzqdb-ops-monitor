@@ -200,6 +200,36 @@ function formatPercent(value, total) {
   return `${Math.round((Number(value || 0) * 10000) / total) / 100}%`;
 }
 
+function primaryConnections(item) {
+  const total = Number(item.primary_tenant_count || 0);
+  const sampled = Number(item.primary_connection_sample_count || 0);
+  if (!total) return "无已识别主租户";
+  if (!sampled) return `暂无采样（0/${total}）`;
+  const range = [item.primary_connections_oldest_at, item.primary_connections_latest_at]
+    .filter(Boolean).filter((value, index, values) => values.indexOf(value) === index).join(" 至 ");
+  return `<span title="${safe(range)}">${safe(item.primary_connections)}${sampled < total ? "（部分）" : ""}
+    <br><small>已采 ${sampled}/${total} · ${safe(item.primary_connections_latest_at || "—")}</small></span>`;
+}
+
+function odpConnections(item) {
+  const odp = item.odp_connections;
+  if (!odp) return "待采集";
+  const coverage = `${odp.sampled_nodes}/${odp.nodes} 节点 · ${odp.sampled_at || "—"}`;
+  if (odp.connections == null) {
+    const reason = odp.reachable_nodes ? "未找到集群指标" : "监控不可达";
+    return `${reason}<br><small>${safe(coverage)}</small>`;
+  }
+  return `${safe(odp.connections)}${odp.sampled_nodes < odp.nodes ? "（部分）" : ""}
+    <br><small>${safe(coverage)}</small>`;
+}
+
+function odpLimit(item) {
+  const odp = item.odp_connections;
+  if (!odp || odp.limit == null) return "未录入实测上限";
+  return `${safe(odp.limit)}${odp.shared ? "（共享）" : ""}
+    <br><small>实例配置汇总</small>`;
+}
+
 function renderClusters(rows) {
   renderObserverLogClusterOptions(rows);
   els.clusterRows.innerHTML = rows.length ? rows.map((item) => `
@@ -213,6 +243,9 @@ function renderClusters(rows) {
       <td>${safe(item.version || "待采集")}</td>
       <td>${safe(item.tenant_count)}</td>
       <td>${safe(item.observer_count)}</td>
+      <td>${primaryConnections(item)}</td>
+      <td>${odpConnections(item)}</td>
+      <td>${odpLimit(item)}</td>
       <td>${badge(item.status)}</td>
       <td>${clusterScheduleText(item)}</td>
       <td>${safe(item.owner)}</td>
@@ -234,7 +267,7 @@ function renderClusters(rows) {
         <button class="small danger" data-delete-cluster="${safe(item.id)}">删除</button>
       </td>
     </tr>
-  `).join("") : emptyRow(13, "暂无 OB 集群，请点击“新增集群”手工录入，或配置 OCP 后同步。");
+  `).join("") : emptyRow(16, "暂无 OB 集群，请点击“新增集群”手工录入，或配置 OCP 后同步。");
   document.querySelectorAll("[data-collect]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.dataset.hasPassword === "0") {
