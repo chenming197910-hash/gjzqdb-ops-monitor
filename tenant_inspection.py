@@ -1,6 +1,6 @@
 """Daily persisted two-password budget, encrypted profiles and parameter drift reports."""
-import hashlib,json,os,re
-from datetime import datetime,timedelta
+import hashlib,json,logging,os,re,traceback
+from datetime import datetime,timedelta,timezone
 from decimal import Decimal,InvalidOperation
 from pathlib import Path
 from cryptography.fernet import Fernet
@@ -12,7 +12,7 @@ def api():
     return app
 
 
-def now():return api().local_now()
+def now():return datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
 
 def write(db,sql,params,clobs=()):
     params=api().bind_params(sql,params)
@@ -46,7 +46,8 @@ def view_config(db):
         oracle_user=row.get('oracle_user') or 'SYS',mysql_user=row.get('mysql_user') or 'root',
         has_primary=bool(row.get('primary_cipher')),has_secondary=bool(row.get('secondary_cipher')),
         rules=parse_json(row.get('baseline_json'),[]),cluster_ids=parse_json(row.get('cluster_ids_json'),[]),
-        request_day=row.get('request_day'),last_run_day=row.get('last_run_day'))
+        request_day=row.get('request_day'),last_run_day=row.get('last_run_day'),
+        today=now().date().isoformat())
 
 
 def assert_budget_schema(db):
@@ -161,13 +162,19 @@ def compare_rules(mode,rules,collected):
     for rule in rules:
         if rule['mode']!=mode:continue
         rows=collected.get('params_'+rule['kind'],[])
+        kind=rule['kind']
         available=[r for r in rows if str(r.get('name','')).lower()==rule['name'].lower()]
+        if not available and kind != 'ob_parameter':
+            fallback = collected.get('params_ob_fallback', [])
+            fallback_matches = [r for r in fallback if str(r.get('name', '')).lower() == rule['name'].lower()]
+            if fallback_matches or (not any(r.get('_error') for r in rows) and any(r.get('_error') for r in fallback)):
+                rows, available, kind = fallback, fallback_matches, 'ob_parameter'
         if any(r.get('_error') for r in rows):status='unreadable';actual=[]
         elif not available:status='missing';actual=[]
         else:
             actual=list(dict.fromkeys(str(r.get('value') if r.get('value') is not None else '') for r in available))
             status='match' if all(normal_value(v)==normal_value(rule['expected']) for v in actual) else 'mismatch'
-        results.append(dict(rule,status=status,actual=actual))
+        results.append(dict(rule,kind=kind,status=status,actual=actual))
     return results
 
 
@@ -207,18 +214,30 @@ def inspect_tenant(db,tenant,profile,passwords,day):
         except Exception:
             complete('uncertain','巡检异常，登录结果不确定；停止重试，需人工核查',locked=True);return 'uncertain'
         # Authentication succeeded. Never try another password for SQL/query/storage errors.
+        checks=[]
+        stage='compare_rules'
         try:
             checks=compare_rules(tenant['tenant_mode'],rules,collected)
+            stage='store_tenant_detail'
             stats=api().store_tenant_detail(db,tenant['id'],collected)
             bad=[r for r in checks if r['status']!='match']
             result={'checks':checks,'stats':stats,'fallback':bool(auth_failures),'next_slot':slot}
             status='warning' if bad or stats.get('warnings') or auth_failures else 'success'
             message=('次选密码登录成功，以后优先使用次选' if slot==2 else '首选密码登录成功')
             if bad:message+='；存在参数不匹配或无法读取项'
+            stage='save_inspection_result'
             complete(status,message,result,slot=slot);return status
-        except Exception:
+        except Exception as exc:
             db.rollback()
-            complete('query_error','登录成功，但采集/保存失败；不会切换密码或重复登录',slot=slot)
+            error = exc.args[0] if exc.args else None
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            api().log_event(logging.ERROR, 'tenant_inspection_query_error',
+                            tenant_id=tenant['id'], cluster_id=tenant['cluster_id'],
+                            tenant_mode=tenant['tenant_mode'], stage=stage,
+                            error_type=type(exc).__name__,
+                            error_code=getattr(error, 'full_code', None) or getattr(error, 'code', None),
+                            location=f'{Path(frame.filename).name}:{frame.lineno}')
+            complete('query_error','登录成功，但采集/保存失败；不会切换密码或重复登录',{'checks':checks},slot=slot)
             return 'query_error'
     complete('locked','已配置密码全部认证失败；不再自动登录，需确认修正后次日恢复',locked=True)
     return 'locked'
@@ -242,26 +261,150 @@ def confirm_unlock(db,tid):
     return tomorrow
 
 
+def inspection_passwords(profile):
+    cipher=key();passwords={1:cipher.decrypt(profile['primary_cipher'].encode()).decode()}
+    if profile.get('secondary_cipher'):passwords[2]=cipher.decrypt(profile['secondary_cipher'].encode()).decode()
+    if passwords.get(1)==passwords.get(2):raise ValueError('两个密码相同，停止巡检')
+    return passwords
+
+
+def scoped_tenants(db, profile):
+    tenants=api().all_rows(db,'''select t.id,t.name,t.active,t.tenant_mode,t.cluster_id,c.name as cluster_name,c.endpoint,c.port
+      from tenants t join clusters c on c.id=t.cluster_id where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL')
+      and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' order by c.name,t.name''')
+    scope=parse_json(profile.get('cluster_ids_json'),[])
+    return [tenant for tenant in tenants if not scope or tenant['cluster_id'] in scope]
+
+
 def run_daily(db):
     profile=config(db);moment=now();day=moment.date().isoformat()
     requested=profile.get('request_day')==day
     if not profile.get('primary_cipher'):return {'state':'unconfigured'}
     if not requested and (not profile.get('enabled') or moment.strftime('%H:%M')<profile['run_time'] or profile.get('last_run_day')==day):return {'state':'not_due'}
     assert_budget_schema(db)
-    cipher=key();passwords={1:cipher.decrypt(profile['primary_cipher'].encode()).decode()}
-    if profile.get('secondary_cipher'):passwords[2]=cipher.decrypt(profile['secondary_cipher'].encode()).decode()
-    if passwords.get(1)==passwords.get(2):raise ValueError('两个密码相同，停止巡检')
-    tenants=api().all_rows(db,'''select t.id,t.name,t.active,t.tenant_mode,t.cluster_id,c.name as cluster_name,c.endpoint,c.port
-      from tenants t join clusters c on c.id=t.cluster_id where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL')
-      and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' order by c.name,t.name''')
-    scope=parse_json(profile.get('cluster_ids_json'),[]);summary={}
-    for tenant in tenants:
+    passwords=inspection_passwords(profile)
+    summary={}
+    for tenant in scoped_tenants(db, profile):
         if now().date().isoformat()!=day:
             summary['day_changed']=1;break
-        if scope and tenant['cluster_id'] not in scope:continue
         status=inspect_tenant(db,tenant,profile,passwords,day);summary[status]=summary.get(status,0)+1
     write(db,'''update tenant_inspection_config set last_run_day=:day,request_day=case when request_day=:day then null else request_day end where id=1''',{'day':day});db.commit()
     return summary
+
+
+def latest_manual_job(db):
+    row=api().one(db, """select id,status,queued_at,finished_at,result_json
+        from tenant_manual_collection_jobs order by id desc fetch first 1 rows only""")
+    if row:
+        row['results']=parse_json(row.pop('result_json'), [])
+    return row
+
+
+def queue_manual(db):
+    profile=api().one(db, 'select * from tenant_inspection_config where id=1 for update')
+    if not profile or not profile.get('primary_cipher'):
+        db.rollback()
+        raise ValueError('请先保存首选密码')
+    job=latest_manual_job(db)
+    if not job or job['status'] not in ('queued','running'):
+        write(db, "insert into tenant_manual_collection_jobs(status) values('queued')", {})
+    db.commit()
+
+
+def set_manual_target(db, identity, credential_key, blocked, slot):
+    write(db, """merge into tenant_manual_collection_state t
+      using(select :identity target_key from dual) s on(t.tenant_identity=s.target_key)
+      when matched then update set credential_key=:credential_key,blocked=:blocked,preferred_slot=:slot
+      when not matched then insert(tenant_identity,credential_key,blocked,preferred_slot)
+      values(:identity,:credential_key,:blocked,:slot)""",
+      dict(identity=identity,credential_key=credential_key,blocked=int(blocked),slot=slot))
+
+
+def collect_manual_target(db, tenant, profile, passwords, rules):
+    identity=target_identity(tenant)
+    daily=api().one(db,'select * from tenant_inspection_locks where tenant_identity=:identity',{'identity':identity}) or {}
+    if daily.get('locked') or (daily.get('not_before_day') or '') > now().date().isoformat():
+        return dict(status='blocked',message='该租户处于定时巡检登录保护期')
+    user=profile['oracle_user' if tenant['tenant_mode']=='ORACLE' else 'mysql_user']
+    cfg=dict(tenant,login_user=api().build_tenant_collect_user(user,tenant))
+    # Identify the saved credentials without storing plaintext or a password hash.
+    credential_key=hashlib.sha256(json.dumps([user,profile.get('primary_cipher'),profile.get('secondary_cipher')]).encode()).hexdigest()
+    prior=api().one(db,'select * from tenant_manual_collection_state where tenant_identity=:identity',{'identity':identity}) or {}
+    same=prior.get('credential_key')==credential_key
+    if same and prior.get('blocked'):
+        return dict(status='blocked',message='此前手工登录失败或中断，请核对并重新保存密码')
+    preferred=(prior.get('preferred_slot') if same else None) or daily.get('preferred_slot') or 1
+    for slot in (preferred,3-preferred):
+        if slot not in passwords:
+            continue
+        # Commit the guard before attempting login so a killed worker cannot retry blindly.
+        set_manual_target(db,identity,credential_key,True,slot)
+        db.commit()
+        try:
+            collected=collect_once(cfg,passwords[slot],rules)
+        except AuthenticationFailed:
+            continue
+        except (AccountLocked,SessionFailed):
+            return dict(status='blocked',message='账号锁定或连接状态不确定，已停止手工重试')
+        set_manual_target(db,identity,credential_key,False,slot)
+        db.commit()
+        checks=compare_rules(tenant['tenant_mode'],rules,collected)
+        try:
+            stats=api().store_tenant_detail(db,tenant['id'],collected)
+        except Exception as exc:
+            db.rollback()
+            error = exc.args[0] if exc.args else None
+            frames = traceback.extract_tb(exc.__traceback__)
+            api().log_event(logging.ERROR, 'tenant_manual_store_error',
+                            tenant_id=tenant['id'], tenant_mode=tenant['tenant_mode'],
+                            error_type=type(exc).__name__,
+                            error_code=getattr(error, 'full_code', None) or getattr(error, 'code', None),
+                            location=' > '.join(f'{Path(frame.filename).name}:{frame.lineno}' for frame in frames))
+            return dict(status='query_error',message='登录成功，采集入库失败',checks=checks)
+        db.commit()
+        warning=stats.get('warnings') or any(check['status']!='match' for check in checks)
+        return dict(status='warning' if warning else 'success',message='采集有提醒' if warning else '采集完成',
+                    checks=checks,stats=stats)
+    return dict(status='blocked',message='密码认证失败，已停止手工重试')
+
+
+def run_manual(db):
+    job=latest_manual_job(db)
+    if not job:
+        return
+    if job['status']=='running':
+        # The service holds the worker lock, so a running record is from an interrupted process.
+        write(db,"update tenant_manual_collection_jobs set status='interrupted',finished_at=systimestamp where id=:id",{'id':job['id']})
+        db.commit()
+        return
+    if job['status']!='queued':
+        return
+    with db.cursor() as cur:
+        cur.execute("update tenant_manual_collection_jobs set status='running' where id=:id and status='queued'",{'id':job['id']})
+        if cur.rowcount!=1:
+            db.rollback()
+            return
+    db.commit()
+    results=[]
+    status='complete'
+    try:
+        profile=config(db)
+        passwords=inspection_passwords(profile)
+        rules=validate_rules(parse_json(profile.get('baseline_json'),[]))
+        for tenant in scoped_tenants(db,profile):
+            result=collect_manual_target(db,tenant,profile,passwords,rules)
+            results.append(dict(result,tenant_id=tenant['id'],name=tenant['name'],cluster_name=tenant['cluster_name']))
+            write(db,'update tenant_manual_collection_jobs set result_json=:results where id=:id',
+                  {'id':job['id'],'results':json.dumps(results,ensure_ascii=False,default=str)},('results',))
+            db.commit()
+    except Exception as exc:
+        db.rollback()
+        status='failed'
+        api().log_event(logging.ERROR,'tenant_manual_collection_failed',job_id=job['id'],error_type=type(exc).__name__)
+    write(db,"""update tenant_manual_collection_jobs set status=:status,finished_at=systimestamp where id=:id""",
+          {'id':job['id'],'status':status})
+    db.commit()
+    return {'manual_job':job['id'],'status':status,'processed':len(results)}
 
 
 def register_routes(flask_app):
@@ -284,10 +427,14 @@ def register_routes(flask_app):
         return jsonify({'saved':True})
     @flask_app.route('/api/tenant-inspection/run',methods=['POST'])
     def inspection_request():
-        if not config(g.db).get('primary_cipher'):return jsonify({'message':'请先保存首选密码'}),400
-        day=now().date().isoformat()
-        write(g.db,'update tenant_inspection_config set request_day=:day where id=1',{'day':day});g.db.commit()
-        return jsonify({'queued':True,'message':'已提交今日任务；由后台执行，重复点击不会增加登录次数'})
+        try:
+            queue_manual(g.db)
+        except ValueError as exc:
+            return jsonify({'message':str(exc)}),400
+        return jsonify({'queued':True,'message':'手工采集已提交，执行中的重复点击会合并'})
+    @flask_app.route('/api/tenant-inspection/manual')
+    def inspection_manual():
+        return jsonify(latest_manual_job(g.db) or {})
     @flask_app.route('/api/tenant-inspection/results')
     def inspection_results():
         rows=api().all_rows(g.db,'''select t.id,t.cluster_id,t.name,t.tenant_mode,c.name as cluster_name,

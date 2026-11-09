@@ -2,8 +2,7 @@
 Description=Check tenant inspection daily schedule and manual queue
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
+OnCalendar=*-*-* *:*:00
 AccuracySec=5s
 
 [Install]

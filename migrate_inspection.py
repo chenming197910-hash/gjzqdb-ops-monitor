@@ -22,6 +22,7 @@ def main():
                 try:cur.execute(sql)
                 except oracledb.DatabaseError as exc:
                     if getattr(exc.args[0],'code',None)!=955:raise
+        db.commit()
         print('每日巡检表迁移完成；默认未启用巡检，未发起租户登录。')
     finally:db.close()
 

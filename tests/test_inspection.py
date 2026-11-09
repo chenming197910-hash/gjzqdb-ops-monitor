@@ -129,10 +129,28 @@ class Inspection(unittest.TestCase):
         self.assertNotIn('private-password',' '.join(args));self.assertNotIn('private-password',run.call_args.kwargs['input'])
     def test_obclient_reuses_authenticated_session_and_parses_results(self):
         cfg=dict(self.tenant,tenant_mode='ORACLE',login_user='SYS@business#cluster')
-        output='marker\nOBI_test_AUTH\nmarker\nOBI_test_BEGIN_0\ndatabase_name\ttable_name\nAPP\tORDERS\nmarker\nOBI_test_END_0\n'
+        output='marker\nOBI_test_AUTH\nmarker\nOBI_test_BEGIN_0\nDATABASE_NAME\tTABLE_NAME\tTOTAL_GB\nAPP\tORDERS\t12.5\nMARKER\nOBI_test_END_0\n'
         with patch('inspection_client.shutil.which',return_value='/usr/bin/obclient'),patch('inspection_client.uuid.uuid4',return_value=SimpleNamespace(hex='test')),patch('inspection_client.subprocess.run',return_value=SimpleNamespace(stdout=output,stderr='',returncode=0)) as run:
             data=client.collect_oracle(cfg,'private-password',[])
-        run.assert_called_once();self.assertEqual(data['top_objects'][0]['table_name'],'ORDERS')
+        run.assert_called_once();self.assertEqual(data['top_objects'],[{'database_name':'APP','table_name':'ORDERS','total_gb':'12.5'}])
+
+    def test_oracle_rejects_incomplete_result_without_discarding_individual_rows(self):
+        cfg=dict(self.tenant,tenant_mode='ORACLE',login_user='SYS@business#cluster')
+        output=('MARKER\nOBI_test_AUTH\nMARKER\nOBI_test_BEGIN_0\n'
+                'DATABASE_NAME\tTABLE_NAME\tTOTAL_GB\nAPP\tORDERS\t12.5\nAPP\t\t99\nMARKER\nOBI_test_END_0\n')
+        with patch('inspection_client.shutil.which',return_value='/usr/bin/obclient'),patch('inspection_client.uuid.uuid4',return_value=SimpleNamespace(hex='test')),patch('inspection_client.subprocess.run',return_value=SimpleNamespace(stdout=output,stderr='',returncode=0)):
+            data=client.collect_oracle(cfg,'private-password',[])
+        self.assertIn('_error',data['top_objects'][0])
+
+    def test_incomplete_capacity_preserves_prior_snapshot_but_keeps_process_sample(self):
+        data={'top_objects':[{'table_name':'ORDERS','total_gb':12.5},{'total_gb':99}],
+              'runtime_metrics':[{'current_processes':3}]}
+        with patch.object(app,'insert_returning_id') as insert:
+            stats=app.store_tenant_detail(Mock(),7,data)
+        self.assertEqual(stats['top_objects'],0)
+        self.assertEqual(stats['runtime_metrics'],1)
+        self.assertIn('整组未入库',stats['warnings'][0])
+        self.assertIn('tenant_runtime_metrics',insert.call_args.args[1])
 
     def test_mysql_single_connection_even_for_multiple_queries(self):
         conn=Mock();driver=Mock();driver.connect.return_value=conn

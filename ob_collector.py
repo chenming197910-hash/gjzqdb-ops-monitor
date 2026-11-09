@@ -612,7 +612,7 @@ TENANT_MERGE_QUERIES = [
 ]
 
 
-TENANT_TOP_OBJECT_QUERIES = [
+TENANT_TOP_OBJECT_QUERY_TEMPLATES = [
     """
     select table_schema as database_name,
            table_name,
@@ -623,6 +623,7 @@ TENANT_TOP_OBJECT_QUERIES = [
            table_rows
     from information_schema.tables
     where table_schema not in ('oceanbase', 'information_schema', 'mysql', 'performance_schema')
+    {table_filter}
     order by coalesce(data_length, 0) + coalesce(index_length, 0) desc
     """,
 ]
@@ -637,7 +638,7 @@ TENANT_RUNTIME_QUERIES = [
 ]
 
 
-ORACLE_TENANT_TOP_OBJECT_QUERIES = [
+ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES = [
     """
     select *
     from (
@@ -657,6 +658,7 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
          and dt.table_name = o.object_name
         where o.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
           and o.object_type in ('TABLE', 'INDEX', 'LOB', 'LOBSEGMENT', 'TABLE PARTITION', 'INDEX PARTITION')
+          {table_filter}
           and nvl(t.data_size, 0) > 0
         group by o.owner, o.object_name, o.object_type
         order by max(t.data_size) desc
@@ -678,6 +680,7 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
           on dt.owner = s.owner
          and dt.table_name = s.segment_name
         where s.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
+        {table_filter}
         group by s.owner, s.segment_name, s.segment_type
         having sum(s.bytes) > 0
         order by sum(s.bytes) desc
@@ -697,11 +700,33 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
         from user_segments s
         left join user_tables ut
           on ut.table_name = s.segment_name
+        {table_filter}
         group by s.segment_name, s.segment_type
         order by sum(s.bytes) desc
     )
     where rownum <= 50
     """,
+]
+
+
+
+TENANT_TOP_OBJECT_QUERIES = [
+    sql.format(table_filter="") for sql in TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+TENANT_TOP_TABLE_QUERIES = [
+    sql.format(table_filter="and table_type = 'BASE TABLE'") + " limit 10"
+    for sql in TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+ORACLE_TENANT_TOP_OBJECT_QUERIES = [
+    sql.format(table_filter="") for sql in ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+ORACLE_TENANT_TOP_TABLE_QUERIES = [
+    sql.format(table_filter=table_filter).replace("rownum <= 50", "rownum <= 10")
+    for sql, table_filter in zip(ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES, (
+        "and o.object_type = 'TABLE'",
+        "and s.segment_type = 'TABLE'",
+        "where s.segment_type = 'TABLE'",
+    ))
 ]
 
 

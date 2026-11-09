@@ -7,6 +7,7 @@ import subprocess
 import zipfile
 from io import BytesIO
 from datetime import datetime
+from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -420,8 +421,13 @@ def create_app():
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
+    @app.route("/api/tenants/inspection-rankings")
+    def tenant_inspection_rankings():
+        return jsonify(tenant_metric_rankings(g.db))
+
     @app.route("/api/tenants/<int:tenant_id>")
     def tenant_detail(tenant_id):
+        from tenant_inspection import managed
         tenant = get_tenant_with_cluster(g.db, tenant_id)
         if not tenant:
             return jsonify({"error": "tenant not found"}), 404
@@ -452,6 +458,8 @@ def create_app():
                 "tenant": tenant,
                 "connection": connection or {},
                 "runtime": runtime or {},
+                "runtime_daily": daily_tenant_runtime(g.db, tenant_id),
+                "inspection_managed": managed(g.db, tenant),
                 "runtime_history": all_rows(
                     g.db,
                     """
@@ -470,6 +478,7 @@ def create_app():
                            total_gb, table_rows, collected_at
                     from tenant_top_objects
                     where tenant_id = :tenant_id
+                      and object_type = 'TABLE'
                       and collected_at = (
                         select max(collected_at)
                         from tenant_top_objects
@@ -1708,13 +1717,71 @@ def upsert_cluster_schedule(db, cluster_id, payload):
     )
 
 
+def daily_tenant_runtime(db, tenant_id):
+    return all_rows(db, """
+        select sample_day, current_processes, max_processes, collected_at
+        from (
+            select to_char(collected_at, 'YYYY-MM-DD') as sample_day,
+                   current_processes, max_processes, collected_at,
+                   row_number() over (partition by trunc(collected_at)
+                                      order by collected_at desc, id desc) as rn
+            from tenant_runtime_metrics
+            where tenant_id = :tenant_id
+              and collected_at >= trunc(cast(systimestamp at time zone '+08:00' as timestamp)) - 29
+        )
+        where rn = 1
+        order by sample_day
+    """, {"tenant_id": tenant_id})
+
+
+def tenant_metric_rankings(db):
+    processes = all_rows(db, """
+        select t.id as tenant_id, t.name as tenant_name, c.name as cluster_name,
+               r.current_processes, r.collected_at
+        from tenants t join clusters c on c.id = t.cluster_id
+        join (
+            select m.*, row_number() over (
+                partition by tenant_id order by collected_at desc, id desc
+            ) as rn
+            from tenant_runtime_metrics m
+        ) r on r.tenant_id = t.id and r.rn = 1
+        where t.active = 1 and lower(t.name) <> 'sys' and lower(t.name) not like 'meta$%'
+          and r.current_processes is not null
+        order by r.current_processes desc, t.id
+        fetch first 10 rows only
+    """)
+    tables = all_rows(db, """
+        select t.id as tenant_id, t.name as tenant_name, c.name as cluster_name,
+               o.database_name, o.object_name, o.total_gb, o.collected_at
+        from tenants t join clusters c on c.id = t.cluster_id
+        join (
+            select x.*, max(collected_at) over (partition by tenant_id) as latest_at
+            from tenant_top_objects x
+        ) o on o.tenant_id = t.id and o.collected_at = o.latest_at
+        where t.active = 1 and lower(t.name) <> 'sys' and lower(t.name) not like 'meta$%'
+          and o.object_type = 'TABLE' and o.total_gb is not null
+        order by o.total_gb desc, t.id, o.database_name, o.object_name, o.id
+        fetch first 10 rows only
+    """)
+    return {"processes": processes, "tables": tables}
+
+
 def store_tenant_detail(db, tenant_id, collected):
     stats = {"top_objects": 0, "runtime_metrics": 0, "warnings": []}
     collected_at = local_now().strftime("%Y-%m-%d %H:%M:%S")
-    for item in collected.get("top_objects", []):
-        if item.get("_error"):
-            stats["warnings"].append(f"十大对象采集失败: {item['_error'][:300]}")
-            continue
+    objects = collected.get("top_objects", [])
+    errors = [row["_error"] for row in objects if row.get("_error")]
+    if errors:
+        stats["warnings"].append(f"表容量未更新，保留上次快照：{errors[0][:300]}")
+        objects = []
+    elif any(not str(row.get("table_name") or row.get("object_name") or "").strip()
+             or to_number(row.get("total_gb")) is None for row in objects):
+        stats["warnings"].append("表容量结果不完整，整组未入库，保留上次快照")
+        objects = []
+    elif "top_objects" in collected and not objects:
+        stats["warnings"].append("本次容量查询未返回表，历史榜单仍可能显示上次采样")
+    for item in objects:
+        object_name = item.get("table_name") or item.get("object_name")
         insert_returning_id(
             db,
             """
@@ -1729,12 +1796,12 @@ def store_tenant_detail(db, tenant_id, collected):
             {
                 "tenant_id": tenant_id,
                 "database_name": item.get("database_name") or "",
-                "object_name": item.get("table_name") or item.get("object_name") or "",
+                "object_name": object_name,
                 "object_type": item.get("object_type") or "TABLE",
                 "data_gb": to_number(item.get("data_gb")),
                 "index_gb": to_number(item.get("index_gb")),
                 "total_gb": to_number(item.get("total_gb")),
-                "table_rows": int(item.get("table_rows") or 0),
+                "table_rows": int(Decimal(str(item.get("table_rows") or 0))),
                 "collected_at": collected_at,
             },
         )

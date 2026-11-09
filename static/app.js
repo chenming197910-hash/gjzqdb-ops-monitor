@@ -59,6 +59,7 @@ async function loadAll() {
     ["/api/summary", null, renderSummary],
     ["/api/clusters", "clusters", rows => {renderTenantClusterFilter(rows); renderClusters(rows);}],
     ["/api/tenants", "tenants", rows => {renderTenantResourceCharts(rows); renderTenants(rows);}],
+    ["/api/tenants/inspection-rankings", null, rows => renderTenantRankings(rows)],
     ["/api/servers", "servers", renderServers],
     ["/api/logs", "logs", renderLogs],
     ["/api/log-alerts", "topAlerts", renderTopAlerts],
@@ -775,6 +776,12 @@ function renderTenantDetail(data) {
       <button class="detail-metric" data-runtime-history="${safe(t.id)}"><span>最大进程数</span><b>${safe(runtime.max_processes ?? "-")}</b></button>
     </div>
     <section class="detail-section">
+      <h3>近 30 天每日进程数</h3>
+      <p>每天显示最后一次采样，缺采日留空。</p>
+      <div class="history-chart">${renderRuntimeHistoryChart(data.runtime_daily || [], true)}</div>
+    </section>
+    ${data.inspection_managed ? '<section class="detail-section"><h3>采集配置</h3><p>此租户使用巡检页已加密保存的账号和密码。</p><a href="/tenant-inspection">查看业务租户巡检</a></section>' : `
+    <section class="detail-section">
       <h3>租户连接</h3>
       <form id="tenantConnectionForm" class="inline-form" data-oracle-tenant="${isOracleTenant(t) ? "1" : "0"}">
         <label>用户名<input name="tenant_user" value="${safe(baseTenantUser(conn.tenant_user || ""))}" placeholder="例如 root"></label>
@@ -810,7 +817,8 @@ function renderTenantDetail(data) {
         <p class="schedule-summary" id="scheduleSummary"></p>
       </form>
     </section>
-    ${detailTable("十大容量对象", ["数据库", "对象", "类型", "数据GB", "索引GB", "总GB", "行数", "采集时间"], data.top_objects.map((o) => [
+    `}
+    ${detailTable("表大小前 10", ["数据库", "对象", "类型", "数据GB", "索引GB", "总GB", "行数", "采集时间"], data.top_objects.map((o) => [
       o.database_name,
       htmlCell(`<button class="link-button" data-object-history="${encodeURIComponent(JSON.stringify({tenant_id: t.id, database_name: o.database_name, object_name: o.object_name, object_type: o.object_type}))}">${safe(o.object_name)}</button>`),
       o.object_type,
@@ -833,58 +841,60 @@ function renderTenantDetail(data) {
 
 function bindTenantDetailActions(tenantId) {
   const form = document.querySelector("#tenantConnectionForm");
-  bindScheduleForm();
-  bindTenantLoginPreview();
   document.querySelectorAll("[data-runtime-history]").forEach((button) => {
     button.addEventListener("click", () => openRuntimeHistory(tenantId));
   });
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      await api(`/api/tenants/${tenantId}/connection`, { method: "POST", body: JSON.stringify(formToPayload(form)) });
-      showToast("租户采集账号已保存");
-      await openTenantDetail(tenantId);
-    } catch (error) {
-      showToast(error.message);
-    }
-  });
-  document.querySelector("[data-tenant-test]").addEventListener("click", async () => {
-    try {
-      const result = await api(`/api/tenants/${tenantId}/connection/test`, { method: "POST", body: JSON.stringify(formToPayload(form)) });
-      showToast(result.message || "租户连接测试成功");
-      await loadAll();
-    } catch (error) {
-      showToast(error.message);
-      setStatus(`租户连接测试失败：${error.message}`);
-      await loadAll();
-      scrollToSection("jobsSection");
-    }
-  });
-  document.querySelector("#tenantScheduleForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      const payload = formToPayload(event.currentTarget);
-      payload.enabled = Boolean(event.currentTarget.elements.enabled.checked);
-      await api(`/api/tenants/${tenantId}/schedule`, { method: "POST", body: JSON.stringify(payload) });
-      showToast("定时采集计划已保存");
-      await openTenantDetail(tenantId);
-    } catch (error) {
-      showToast(error.message);
-      setStatus(`租户详情采集失败：${error.message}`);
-      await loadAll();
-      scrollToSection("jobsSection");
-    }
-  });
-  document.querySelector("[data-tenant-collect]").addEventListener("click", async () => {
-    try {
-      showToast("正在只读采集租户详情...");
-      const result = await api(`/api/tenants/${tenantId}/collect-detail`, { method: "POST", body: "{}" });
-      showToast(`租户采集完成：十大对象${result.top_objects || 0}，运行指标${result.runtime_metrics || 0}`);
-      await openTenantDetail(tenantId);
-    } catch (error) {
-      showToast(error.message);
-    }
-  });
+  if (form) {
+    bindScheduleForm();
+    bindTenantLoginPreview();
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await api(`/api/tenants/${tenantId}/connection`, { method: "POST", body: JSON.stringify(formToPayload(form)) });
+        showToast("租户采集账号已保存");
+        await openTenantDetail(tenantId);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+    document.querySelector("[data-tenant-test]").addEventListener("click", async () => {
+      try {
+        const result = await api(`/api/tenants/${tenantId}/connection/test`, { method: "POST", body: JSON.stringify(formToPayload(form)) });
+        showToast(result.message || "租户连接测试成功");
+        await loadAll();
+      } catch (error) {
+        showToast(error.message);
+        setStatus(`租户连接测试失败：${error.message}`);
+        await loadAll();
+        scrollToSection("jobsSection");
+      }
+    });
+    document.querySelector("#tenantScheduleForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const payload = formToPayload(event.currentTarget);
+        payload.enabled = Boolean(event.currentTarget.elements.enabled.checked);
+        await api(`/api/tenants/${tenantId}/schedule`, { method: "POST", body: JSON.stringify(payload) });
+        showToast("定时采集计划已保存");
+        await openTenantDetail(tenantId);
+      } catch (error) {
+        showToast(error.message);
+        setStatus(`租户详情采集失败：${error.message}`);
+        await loadAll();
+        scrollToSection("jobsSection");
+      }
+    });
+    document.querySelector("[data-tenant-collect]").addEventListener("click", async () => {
+      try {
+        showToast("正在只读采集租户详情...");
+        const result = await api(`/api/tenants/${tenantId}/collect-detail`, { method: "POST", body: "{}" });
+        showToast(`租户采集完成：十大对象${result.top_objects || 0}，运行指标${result.runtime_metrics || 0}`);
+        await openTenantDetail(tenantId);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  }
   document.querySelectorAll("[data-object-history]").forEach((button) => {
     button.addEventListener("click", () => openObjectHistory(JSON.parse(decodeURIComponent(button.dataset.objectHistory))));
   });
@@ -1022,23 +1032,36 @@ function renderLineChart(rows) {
   `;
 }
 
-function renderRuntimeHistoryChart(rows) {
+function renderRuntimeHistoryChart(rows, daily = false) {
   if (!rows.length) return `<div class="empty-chart">暂无进程历史数据</div>`;
   const width = 720;
   const height = 220;
   const pad = 28;
-  const currentValues = rows.map((row) => Number(row.current_processes || 0));
-  const maxValues = rows.map((row) => Number(row.max_processes || 0));
+  const currentValues = rows.map(row => row.current_processes);
+  const maxValues = rows.map(row => row.max_processes);
   const max = Math.max(...currentValues, ...maxValues, 1);
-  const currentPoints = chartPoints(currentValues, width, height, pad, max);
-  const maxPoints = chartPoints(maxValues, width, height, pad, max);
+  const dayNumber = row => Date.parse(row.sample_day + "T00:00:00Z") / 86400000;
+  const firstDay = daily ? dayNumber(rows[0]) : 0;
+  const daySpan = daily ? dayNumber(rows[rows.length - 1]) - firstDay : 0;
+  const points = values => chartPoints(values, width, height, pad, max).map((point, index) => ({
+    x: daySpan ? pad + (dayNumber(rows[index]) - firstDay) * (width - 2 * pad) / daySpan : point.x,
+    y: point.y,
+  }));
+  const currentPoints = points(currentValues);
+  const maxPoints = points(maxValues);
+  const lines = (values, series, className) => series.slice(1).map((point, index) => {
+    if (values[index] == null || values[index + 1] == null ||
+        (daily && dayNumber(rows[index + 1]) - dayNumber(rows[index]) > 1)) return "";
+    return `<line x1="${series[index].x}" y1="${series[index].y}" x2="${point.x}" y2="${point.y}" class="${className}"></line>`;
+  }).join("");
   return `
     <svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img">
       <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="axis"></line>
       <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" class="axis"></line>
-      <polyline points="${currentPoints.map((point) => `${point.x},${point.y}`).join(" ")}" class="capacity-line"></polyline>
-      <polyline points="${maxPoints.map((point) => `${point.x},${point.y}`).join(" ")}" class="capacity-line secondary"></polyline>
-      ${currentPoints.map((point, index) => `<circle cx="${point.x}" cy="${point.y}" r="4" class="capacity-point"><title>${safe(rows[index].collected_at)} 当前 ${formatNumber(currentValues[index])}</title></circle>`).join("")}
+      ${lines(currentValues, currentPoints, "capacity-line")}
+      ${lines(maxValues, maxPoints, "capacity-line secondary")}
+      ${currentPoints.map((point, index) => currentValues[index] == null ? "" : `<circle cx="${point.x}" cy="${point.y}" r="4" class="capacity-point"><title>${safe(rows[index].collected_at)} 当前 ${formatNumber(currentValues[index])}</title></circle>`).join("")}
+      ${daily ? `<text x="${pad}" y="${height - 8}" class="chart-label">${safe(rows[0].sample_day)} 至 ${safe(rows[rows.length - 1].sample_day)}</text>` : ""}
       <text x="${pad}" y="18" class="chart-label">当前进程数 / 最大进程数，最大 ${formatNumber(max)}</text>
     </svg>
   `;
@@ -1299,4 +1322,6 @@ els.exportTenants.addEventListener("click", exportTenantExcel);
 
 updateTenantFilterStates();
 loadAll();
+const linkedTenant = new URLSearchParams(window.location.search).get("tenant");
+if (linkedTenant && /^\d+$/.test(linkedTenant)) openTenantDetail(linkedTenant);
 state.refreshTimer = setInterval(loadAll, Number(els.refreshSeconds.value) * 1000);

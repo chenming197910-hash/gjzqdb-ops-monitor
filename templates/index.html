@@ -143,6 +143,11 @@
       </div>
     </section>
 
+    <section class="section" id="tenantRankingsSection">
+      <div class="section-head"><div><h2>业务租户采集排名</h2><p>表容量和进程数据由业务租户巡检统一采集。</p></div><a href="/tenant-inspection">管理业务租户巡检</a></div>
+      {% include "tenant_rankings.html" %}
+    </section>
+
     <section class="section" id="tenantsSection">
       <div class="section-head">
         <div>
@@ -468,6 +473,6 @@
   </div>
 
   <div class="toast" id="toast"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/tenant_rankings.js"></script><script src="/static/app.js"></script>
 </body>
 </html>
