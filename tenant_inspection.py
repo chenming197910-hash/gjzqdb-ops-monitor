@@ -138,13 +138,13 @@ def claim_slot(db,tid,day,slot):
 
 
 def finish(db,tid,day,status,message,result=None,slot=None,locked=False,identity=None):
-    write(db,'''update tenant_inspection_runs set status=:status,message=:message,used_slot=:slot,
+    write(db,'''update tenant_inspection_runs set status=:status,message=:message,used_slot=cast(:slot as number),
       result_json=:result,finished_at=systimestamp where tenant_id=:tid and run_day=:day''',
       dict(tid=tid,day=day,status=status,message=message,slot=slot,result=json.dumps(result or {},ensure_ascii=False,default=str)),('result',))
     write(db,'''merge into tenant_inspection_locks t using(select :identity target_key from dual) s on(t.tenant_identity=s.target_key)
-      when matched then update set tenant_id=:tid,locked=:locked,not_before_day=null,preferred_slot=coalesce(:slot,t.preferred_slot),reason=:reason,updated_at=systimestamp
+      when matched then update set tenant_id=:tid,locked=:locked,not_before_day=null,preferred_slot=coalesce(cast(:slot as number),t.preferred_slot),reason=:reason,updated_at=systimestamp
       when not matched then insert(tenant_identity,tenant_id,locked,preferred_slot,reason,updated_at)
-      values(:identity,:tid,:locked,coalesce(:slot,1),:reason,systimestamp)''',
+      values(:identity,:tid,:locked,coalesce(cast(:slot as number),1),:reason,systimestamp)''',
       dict(tid=tid,identity=identity,locked=int(locked),slot=slot,reason=message if locked else None))
     db.commit()
 
@@ -251,9 +251,9 @@ def confirm_unlock(db,tid):
     # Never remove daily claims. Confirmation cannot reopen today's budget.
     write(db,'''merge into tenant_inspection_locks t using(select :identity target_key from dual) s on(t.tenant_identity=s.target_key)
       when matched then update set locked=0,preferred_slot=1,not_before_day=:day,
-        reason='人工确认已修正密码，次日起允许巡检',updated_at=systimestamp
+        reason='人工确认已修正密码，手工可验证，定时次日恢复',updated_at=systimestamp
       when not matched then insert(tenant_identity,tenant_id,locked,preferred_slot,not_before_day,reason,updated_at)
-        values(:identity,:tid,0,1,:day,'人工确认已修正密码，次日起允许巡检',systimestamp)''',
+        values(:identity,:tid,0,1,:day,'人工确认已修正密码，手工可验证，定时次日恢复',systimestamp)''',
       {'day':tomorrow,'identity':identity,'tid':tid})
     write(db,'''update tenant_inspection_runs set status='confirmed_interrupted',finished_at=systimestamp
        where tenant_identity=:identity and status='running' ''',{'identity':identity})
@@ -273,11 +273,31 @@ def scoped_tenants(db, profile):
       from tenants t join clusters c on c.id=t.cluster_id where t.active=1 and t.tenant_mode in ('ORACLE','MYSQL')
       and lower(t.name)<>'sys' and lower(t.name) not like 'meta$%' and nvl(upper(t.tenant_role),'UNKNOWN') not like '%STANDBY%' order by c.name,t.name''')
     scope=parse_json(profile.get('cluster_ids_json'),[])
-    return [tenant for tenant in tenants if not scope or tenant['cluster_id'] in scope]
+    endpoints = api().CONFIG.get('tenant_inspection_endpoints', {})
+    return [
+        {**tenant, **{key: value for key, value in endpoints.get(tenant['cluster_name'].casefold(), {}).items()
+                     if key in ('endpoint', 'port')}}
+        for tenant in tenants if not scope or tenant['cluster_id'] in scope
+    ]
+
+
+def recover_today_interrupted(db, day):
+    # run_daily is invoked only after the worker acquires the inspection lock.
+    rows = api().all_rows(db, """select tenant_id, tenant_identity
+        from tenant_inspection_runs
+        where run_day=:day and status='running'
+          and (primary_claimed=1 or secondary_claimed=1)""", {'day': day})
+    for row in rows:
+        finish(db, row['tenant_id'], day, 'uncertain',
+               '此前定时任务中断，最终结果未保存；已保留登录次数，需人工核查确认',
+               locked=True, identity=row['tenant_identity'])
+    return len(rows)
 
 
 def run_daily(db):
     profile=config(db);moment=now();day=moment.date().isoformat()
+    recovered=recover_today_interrupted(db,day)
+    if recovered:print('Recovered interrupted inspection records:',recovered)
     requested=profile.get('request_day')==day
     if not profile.get('primary_cipher'):return {'state':'unconfigured'}
     if not requested and (not profile.get('enabled') or moment.strftime('%H:%M')<profile['run_time'] or profile.get('last_run_day')==day):return {'state':'not_due'}
@@ -300,15 +320,29 @@ def latest_manual_job(db):
     return row
 
 
+class ManualCollectionCooldown(ValueError):
+    pass
+
+
 def queue_manual(db):
     profile=api().one(db, 'select * from tenant_inspection_config where id=1 for update')
     if not profile or not profile.get('primary_cipher'):
         db.rollback()
         raise ValueError('请先保存首选密码')
-    job=latest_manual_job(db)
-    if not job or job['status'] not in ('queued','running'):
-        write(db, "insert into tenant_manual_collection_jobs(status) values('queued')", {})
+    job = api().one(db, """select status,
+        case when cast(systimestamp as timestamp) <= coalesce(finished_at, queued_at) + interval '5' minute
+             then 1 else 0 end as in_cooldown
+        from tenant_manual_collection_jobs
+        order by id desc fetch first 1 rows only""")
+    if job and job['status'] in ('queued', 'running'):
+        db.commit()
+        return False
+    if job and job['in_cooldown']:
+        db.rollback()
+        raise ManualCollectionCooldown('请在上一次手工采集结束超过 5 分钟后再提交')
+    write(db, "insert into tenant_manual_collection_jobs(status) values('queued')", {})
     db.commit()
+    return True
 
 
 def set_manual_target(db, identity, credential_key, blocked, slot):
@@ -323,7 +357,8 @@ def set_manual_target(db, identity, credential_key, blocked, slot):
 def collect_manual_target(db, tenant, profile, passwords, rules):
     identity=target_identity(tenant)
     daily=api().one(db,'select * from tenant_inspection_locks where tenant_identity=:identity',{'identity':identity}) or {}
-    if daily.get('locked') or (daily.get('not_before_day') or '') > now().date().isoformat():
+    # An explicit confirmation clears locked, while not_before_day still gates automatic runs.
+    if daily.get('locked'):
         return dict(status='blocked',message='该租户处于定时巡检登录保护期')
     user=profile['oracle_user' if tenant['tenant_mode']=='ORACLE' else 'mysql_user']
     cfg=dict(tenant,login_user=api().build_tenant_collect_user(user,tenant))
@@ -428,10 +463,13 @@ def register_routes(flask_app):
     @flask_app.route('/api/tenant-inspection/run',methods=['POST'])
     def inspection_request():
         try:
-            queue_manual(g.db)
+            queued = queue_manual(g.db)
+        except ManualCollectionCooldown as exc:
+            return jsonify({'message':str(exc)}),429
         except ValueError as exc:
             return jsonify({'message':str(exc)}),400
-        return jsonify({'queued':True,'message':'手工采集已提交，执行中的重复点击会合并'})
+        message = '手工采集已提交' if queued else '已有手工任务排队或执行中，未新增任务'
+        return jsonify({'queued':queued,'message':message})
     @flask_app.route('/api/tenant-inspection/manual')
     def inspection_manual():
         return jsonify(latest_manual_job(g.db) or {})

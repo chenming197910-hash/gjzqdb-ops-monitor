@@ -17,7 +17,7 @@ function latestResult(row) {
 const resultLabels = {
   success:'正常', warning:'有提醒', blocked:'已保护', query_error:'入库失败',
   locked:'登录失败，已锁定', uncertain:'状态不确定，已锁定',
-  running:'执行中或未确认完成', confirmed_interrupted:'已人工确认，次日恢复',
+  running:'执行中或未确认完成', confirmed_interrupted:'已人工确认，定时次日恢复',
 };
 
 function resultMessage(result) {
@@ -159,7 +159,7 @@ el('runToday').onclick = async () => {
   }
 };
 el('passwordCorrected').onchange=()=>{el('confirmResume').disabled=!el('passwordCorrected').checked;};el('cancelResume').onclick=()=>el('confirmDialog').close();
-el('confirmResume').onclick=async()=>{if(!el('passwordCorrected').checked)return;el('confirmResume').disabled=true;try{const result=await api(`/api/tenant-inspection/${confirmId}/confirm`,{method:'POST',body:JSON.stringify({password_corrected:true})});el('confirmDialog').close();el('inspectionStatus').textContent=`已确认，最早 ${result.resume_day} 恢复；今天不会重新登录`;await refreshResults();}catch(e){el('inspectionStatus').textContent=e.message;el('confirmResume').disabled=false;}};
+el('confirmResume').onclick=async()=>{if(!el('passwordCorrected').checked)return;el('confirmResume').disabled=true;try{const result=await api(`/api/tenant-inspection/${confirmId}/confirm`,{method:'POST',body:JSON.stringify({password_corrected:true})});el('confirmDialog').close();el('inspectionStatus').textContent=`已确认，可手工采集验证；定时巡检最早 ${result.resume_day} 恢复`;await refreshResults();}catch(e){el('inspectionStatus').textContent=e.message;el('confirmResume').disabled=false;}};
 el('onlyIssues').onchange=renderResults;el('refreshResults').onclick=()=>refreshResults().catch(e=>el('inspectionStatus').textContent=e.message);
 Promise.all([loadConfig(),refreshResults()]).catch(e=>el('inspectionStatus').textContent='加载失败：'+e.message);
 setInterval(()=>{if(!document.hidden)refreshResults().catch(e=>el('inspectionStatus').textContent=e.message);},30000);

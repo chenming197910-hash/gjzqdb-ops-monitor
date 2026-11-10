@@ -61,6 +61,60 @@ class Inspection(unittest.TestCase):
         with patch.object(app,'one',side_effect=[{}, {'run_day':'2026-11-08'}]),patch.object(ti,'finish') as finish,patch.object(ti,'collect_once') as collect:
             status=ti.inspect_tenant(Mock(),self.tenant,self.profile,{1:'a',2:'b'},'2026-11-09')
         self.assertEqual(status,'uncertain');collect.assert_not_called();self.assertTrue(finish.call_args.kwargs['locked'])
+    def test_failed_login_binds_null_slot_as_numeric(self):
+        db=Mock()
+        with patch.object(ti,'write') as write:
+            ti.finish(db,7,'2026-11-09','locked','认证失败',locked=True,identity='identity')
+        for call in write.call_args_list:
+            self.assertIn('cast(:slot as number)',call.args[1])
+            self.assertIsNone(call.args[2]['slot'])
+        db.commit.assert_called_once()
+
+    def test_recovers_same_day_claim_even_after_daily_batch_is_closed(self):
+        db=Mock()
+        profile={'primary_cipher':'cipher','enabled':True,'run_time':'02:00','last_run_day':'2026-11-09'}
+        with patch.object(ti,'config',return_value=profile),patch.object(app,'all_rows',return_value=[
+            {'tenant_id':7,'tenant_identity':'identity'}]),patch.object(ti,'finish') as finish,patch.object(ti,'collect_once') as login:
+            self.assertEqual(ti.run_daily(db),{'state':'not_due'})
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.args[3],'uncertain')
+        self.assertTrue(finish.call_args.kwargs['locked'])
+        login.assert_not_called()
+
+    def test_manual_collection_can_validate_after_confirmation_today(self):
+        with patch.object(app,'one',side_effect=[{'locked':0,'not_before_day':'2026-11-10'},{}]),patch.object(ti,'collect_once',return_value={}) as login,patch.object(ti,'set_manual_target'),patch.object(app,'store_tenant_detail',return_value={}):
+            result=ti.collect_manual_target(Mock(),self.tenant,self.profile,{1:'secret'},[])
+        self.assertEqual(result['status'],'success')
+        login.assert_called_once()
+
+    def test_manual_collection_respects_unconfirmed_and_manual_locks(self):
+        import hashlib
+        profile=dict(self.profile,primary_cipher='cipher')
+        credential=hashlib.sha256(json.dumps(['root','cipher',None]).encode()).hexdigest()
+        for rows in ([{'locked':1}], [{'locked':0,'not_before_day':'2026-11-10'}, {'blocked':1,'credential_key':credential}]):
+            with patch.object(app,'one',side_effect=rows),patch.object(ti,'collect_once') as login:
+                self.assertEqual(ti.collect_manual_target(Mock(),self.tenant,profile,{1:'secret'},[])['status'],'blocked')
+                login.assert_not_called()
+
+    def test_manual_queue_rejects_cooldown_without_creating_job(self):
+        db = Mock()
+        with patch.object(app, 'one', side_effect=[{'primary_cipher':'configured'},
+                {'status':'complete','in_cooldown':1}]) as query, patch.object(ti, 'write') as write:
+            with self.assertRaises(ti.ManualCollectionCooldown):
+                ti.queue_manual(db)
+        self.assertIn("cast(systimestamp as timestamp) <= coalesce(finished_at, queued_at) + interval '5' minute", query.call_args.args[1])
+        write.assert_not_called()
+        db.rollback.assert_called_once()
+
+    def test_manual_queue_reuses_active_job_and_accepts_after_cooldown(self):
+        for status, expected in [('running',False),('queued',False),('complete',True)]:
+            db = Mock()
+            with patch.object(app,'one',side_effect=[{'primary_cipher':'configured'},
+                    {'status':status,'in_cooldown':0}]),patch.object(ti,'write') as write:
+                self.assertIs(ti.queue_manual(db),expected)
+            self.assertEqual(write.call_count,int(expected))
+            db.commit.assert_called_once()
+
     def test_midnight_stops_attempts_for_old_inspection_day(self):
         with patch.object(ti,'now',return_value=datetime(2026,11,10)),patch.object(ti,'collect_once') as collect:
             status=ti.inspect_tenant(Mock(),self.tenant,self.profile,{1:'a',2:'b'},'2026-11-09')

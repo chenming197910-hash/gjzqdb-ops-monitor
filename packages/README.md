@@ -40,3 +40,9 @@
 [ODP 自动采集增量包](OB_monitor_odp_auto_limits_update.zip) 基于资产管理和 ODP 连接统计增量。部署后重载 Web，运行一次首页小时采集服务。无需数据库迁移。
 
 小时采集使用已有的集群 SYS 凭据逐台查询 ODP 的 `client_max_connections`。默认 SQL 端口为 2883，特殊节点可在 `odp_monitor.sql_port_by_ip` 中覆盖。此前的 `client_max_connections_by_ip` 静态上限配置已由自动查询取代。查询失败的节点和错误码可在首页小时采集服务日志中查看。
+
+## 2026-11-10 阶段版
+
+[巡检阶段版增量包](OB_monitor_stage_20261110.zip) 基于已部署的资产管理、巡检和 ODP 自动上限版本。包内为巡检后端与页面文件，部署前备份这三个文件，覆盖后重载 Web。无需数据库迁移。保留现场 `config.json` 中的业务巡检入口配置。
+
+手工采集只在上一批结束超过 5 分钟后接受新任务。排队或执行中重复提交会复用当前批次。人工确认后可当天手工验证，定时巡检仍按次日恢复。巡检支持按集群设置 `tenant_inspection_endpoints`，其中每项可指定 `endpoint` 和 `port`。阶段版同时修正了锁定结果的空数字绑定及当日中断记录恢复。
