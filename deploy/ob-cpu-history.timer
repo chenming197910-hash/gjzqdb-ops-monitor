@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample OceanBase CPU every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

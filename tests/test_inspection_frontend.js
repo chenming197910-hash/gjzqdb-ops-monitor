@@ -1,0 +1,12 @@
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
+const nodes=new Map(),node=id=>{if(!nodes.has(id))nodes.set(id,{value:'',checked:false,disabled:false,innerHTML:'',textContent:'',querySelectorAll(){return [];},showModal(){this.open=true;},close(){this.open=false;}});return nodes.get(id);};
+const ctx=vm.createContext({document:{getElementById:node,hidden:false},console,setInterval(){},fetch(){throw Error('unexpected network request');}});
+let code=fs.readFileSync(path.join(__dirname,'../static/tenant_inspection.js'),'utf8');code=code.slice(0,code.lastIndexOf('Promise.all([loadConfig()'));vm.runInContext(code,ctx);
+const rules=JSON.parse(JSON.stringify(vm.runInContext("readRules('MYSQL','max_connections=1000\\nob:memory_limit=8G')",ctx)));
+assert.equal(rules[0].kind,'variable');assert.equal(rules[1].kind,'ob_parameter');assert.equal(rules[1].expected,'8G');
+assert.throws(()=>vm.runInContext("readRules('ORACLE','missing equals')",ctx));
+node('passwordCorrected').checked=false;vm.runInContext("el('passwordCorrected').onchange()",ctx);assert.equal(node('confirmResume').disabled,true);
+node('passwordCorrected').checked=true;vm.runInContext("el('passwordCorrected').onchange()",ctx);assert.equal(node('confirmResume').disabled,false);
+vm.runInContext(`resultRows=[{id:7,name:'<script>',tenant_mode:'MYSQL',cluster_name:'test',locked:1,status:'locked',primary_claimed:1,secondary_claimed:1,result:{checks:[{mode:'MYSQL',kind:'variable',name:'max_connections',expected:'1000',actual:['500'],status:'mismatch'}]}}];renderResults()`,ctx);
+assert.match(node('inspectionRows').innerHTML,/首选 1 次/);assert.match(node('inspectionRows').innerHTML,/次选 1 次/);assert.doesNotMatch(node('inspectionRows').innerHTML,/<script>/);assert.match(node('parameterRows').innerHTML,/不匹配/);
+console.log('PASS daily inspection: baseline parsing, explicit confirmation checkbox, attempt counts, drift display and HTML escaping');

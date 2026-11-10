@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh OceanBase homepage every hour
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1h
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

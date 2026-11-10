@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>资产管理 · OB 运维监控平台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>资产管理</h1><p>OceanBase 集群清单和租户连接串</p></div>
+    <a class="cpu-history-link" href="/">返回首页 ↗</a>
+  </header>
+  <main class="page">
+    <section class="section">
+      <div class="section-head"><h2>集群资产</h2></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>集群名</th><th>主机的 IP 地址</th><th>负载均衡的 IP 地址</th><th>集群的作用</th></tr></thead>
+          <tbody>
+          {% for cluster in clusters %}
+            <tr>
+              <td><a href="#asset-{{ cluster.name }}">{{ cluster.name }}</a></td>
+              <td>{{ cluster.hosts }}</td>
+              <td>{{ cluster.lb or '无负载均衡' }}{% if cluster.oblb %}<br><small>OBLB {{ cluster.oblb }}</small>{% endif %}</td>
+              <td>{{ cluster.purpose }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4">尚未配置集群资产清单，请由运维维护人员录入。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><div><h2>各集群租户连接串</h2>
+        <p>包含 SYS 和在册的主备业务租户。负载均衡连接使用 2883，直连默认使用节点 IP 和 2881，使用 -p 提示输入密码。</p>
+        {% if asset_error %}<p role="alert">租户资产库暂不可用，当前仅显示可由集群清单生成的 SYS 连接串。</p>{% endif %}
+      </div></div>
+      {% for cluster in clusters %}
+      <div id="asset-{{ cluster.name }}">
+        <h3>{{ cluster.name }} · {{ cluster.purpose }}</h3>
+        {% if not asset_error and cluster.tenants|length == 1 %}<p>资产库暂无在册业务租户。</p>{% endif %}
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>租户名</th><th>兼容模式</th><th>角色</th><th>连接串</th></tr></thead>
+            <tbody>
+            {% for tenant in cluster.tenants %}
+              <tr><td>{{ tenant.name }}</td><td>{{ tenant.mode }}</td><td>{{ tenant.role }}</td><td><code>{{ tenant.command }}</code></td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,10 @@
+[Unit]
+Description=OceanBase homepage hourly health and asset collection
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gjzqdb
+ExecStart=/root/gjzqdb/.venv/bin/python /root/gjzqdb/run_hourly_collection.py
+Environment=TZ=Asia/Shanghai
+TimeoutStartSec=3300

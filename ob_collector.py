@@ -17,8 +17,13 @@ def collect_ob_cluster(cluster):
     pymysql = load_pymysql()
     conn = open_ob_connection(pymysql, cluster)
     try:
+        inventory = query_first(conn, ["select tenant_id, tenant_name as name from oceanbase.DBA_OB_TENANTS"])
+        authoritative = bool(inventory) and not any(r.get('_error') for r in inventory) and any(str(r.get('tenant_id')) == '1' and r.get('name') == 'sys' for r in inventory)
         return {
             "readonly": True,
+            "cluster_version": read_cluster_version(conn),
+            "inventory_authoritative": authoritative,
+            "inventory_names": [r.get('name') for r in inventory if r.get('name') != 'sys'] if authoritative else [],
             "observers": query_first(conn, OBSERVER_QUERIES),
             "tenants": query_first(conn, TENANT_QUERIES),
             "tenant_backups": query_first(conn, TENANT_BACKUP_QUERIES),
@@ -31,6 +36,22 @@ def collect_ob_cluster(cluster):
     finally:
         conn.close()
 
+
+
+def parse_cluster_version(value):
+    text=str(value or '')
+    # BUILD_VERSION starts with OB's version; VERSION() may start with MySQL's.
+    match=re.search(r'oceanbase[^0-9]*(\d+\.\d+\.\d+(?:\.\d+)?)',text,re.I)
+    if not match:match=re.search(r'(?<![0-9.])(\d+\.\d+\.\d+\.\d+)(?![0-9.])',text)
+    return match.group(1) if match else ''
+
+
+def read_cluster_version(conn):
+    rows=query_first(conn,["select distinct build_version from oceanbase.DBA_OB_SERVERS"])
+    versions=sorted({parse_cluster_version(r.get('build_version')) for r in rows if not r.get('_error')}-{''})
+    if versions:return ', '.join(versions)[:64]
+    rows=query_first(conn,["select version() as ob_version"])
+    return next((v for v in (parse_cluster_version(r.get('ob_version')) for r in rows) if v),'')
 
 def collect_ob_tenant_detail(config):
     if is_oracle_tenant(config):
@@ -591,7 +612,7 @@ TENANT_MERGE_QUERIES = [
 ]
 
 
-TENANT_TOP_OBJECT_QUERIES = [
+TENANT_TOP_OBJECT_QUERY_TEMPLATES = [
     """
     select table_schema as database_name,
            table_name,
@@ -602,6 +623,7 @@ TENANT_TOP_OBJECT_QUERIES = [
            table_rows
     from information_schema.tables
     where table_schema not in ('oceanbase', 'information_schema', 'mysql', 'performance_schema')
+    {table_filter}
     order by coalesce(data_length, 0) + coalesce(index_length, 0) desc
     """,
 ]
@@ -616,7 +638,7 @@ TENANT_RUNTIME_QUERIES = [
 ]
 
 
-ORACLE_TENANT_TOP_OBJECT_QUERIES = [
+ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES = [
     """
     select *
     from (
@@ -636,6 +658,7 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
          and dt.table_name = o.object_name
         where o.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
           and o.object_type in ('TABLE', 'INDEX', 'LOB', 'LOBSEGMENT', 'TABLE PARTITION', 'INDEX PARTITION')
+          {table_filter}
           and nvl(t.data_size, 0) > 0
         group by o.owner, o.object_name, o.object_type
         order by max(t.data_size) desc
@@ -657,6 +680,7 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
           on dt.owner = s.owner
          and dt.table_name = s.segment_name
         where s.owner not in ('SYS', 'SYSTEM', 'LBACSYS', 'ORAAUDITOR', 'OCEANBASE', 'PUBLIC')
+        {table_filter}
         group by s.owner, s.segment_name, s.segment_type
         having sum(s.bytes) > 0
         order by sum(s.bytes) desc
@@ -676,11 +700,33 @@ ORACLE_TENANT_TOP_OBJECT_QUERIES = [
         from user_segments s
         left join user_tables ut
           on ut.table_name = s.segment_name
+        {table_filter}
         group by s.segment_name, s.segment_type
         order by sum(s.bytes) desc
     )
     where rownum <= 50
     """,
+]
+
+
+
+TENANT_TOP_OBJECT_QUERIES = [
+    sql.format(table_filter="") for sql in TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+TENANT_TOP_TABLE_QUERIES = [
+    sql.format(table_filter="and table_type = 'BASE TABLE'") + " limit 10"
+    for sql in TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+ORACLE_TENANT_TOP_OBJECT_QUERIES = [
+    sql.format(table_filter="") for sql in ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES
+]
+ORACLE_TENANT_TOP_TABLE_QUERIES = [
+    sql.format(table_filter=table_filter).replace("rownum <= 50", "rownum <= 10")
+    for sql, table_filter in zip(ORACLE_TENANT_TOP_OBJECT_QUERY_TEMPLATES, (
+        "and o.object_type = 'TABLE'",
+        "and s.segment_type = 'TABLE'",
+        "where s.segment_type = 'TABLE'",
+    ))
 ]
 
 
@@ -737,3 +783,52 @@ PARAMETER_QUERIES = [
                    'datafile_size', 'memory_limit', 'cpu_count')
     """,
 ]
+
+
+def check_ob_major_compaction(cluster, now=None, deadline_hour=12):
+    """Check all SYS-visible tenant major compactions without changing OB.
+
+    'warning' means a confirmed error or an overdue new frozen SCN.
+    'unknown' means there was no verified freeze/completion today.
+    """
+    from datetime import datetime, time
+    now = now or datetime.now()
+    conn = open_ob_connection(load_pymysql(), cluster)
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''select tenant_id, frozen_scn, last_scn, frozen_time,
+                                  last_finish_time, status, is_error, is_suspended, info
+                           from oceanbase.CDB_OB_MAJOR_COMPACTION''')
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return {'status':'unknown','message':'合并视图未返回数据'}
+    errors, pending, completed, unverified = [], [], [], []
+    for row in rows:
+        tid = row.get('tenant_id')
+        if str(row.get('is_error','')).upper() == 'YES' or str(row.get('is_suspended','')).upper() == 'YES':
+            errors.append(f"{tid}({row.get('info') or row.get('status')})")
+            continue
+        try:
+            frozen = row.get('frozen_time')
+            finish = row.get('last_finish_time')
+            if isinstance(frozen,str): frozen=datetime.fromisoformat(frozen[:26])
+            if isinstance(finish,str): finish=datetime.fromisoformat(finish[:26])
+            if frozen and frozen <= now and int(row.get('frozen_scn') or 0)>int(row.get('last_scn') or 0):
+                pending.append(str(tid))
+            elif finish and finish.date()==now.date() and str(row.get('status','')).upper()=='IDLE':
+                completed.append(str(tid))
+        except (TypeError,ValueError):
+            unverified.append(str(tid))
+    if errors:
+        return {'status':'warning','message':'合并错误或暂停，租户ID：'+', '.join(errors[:12])}
+    if pending:
+        if now.time()>=time(deadline_hour):
+            return {'status':'warning','message':'已发起但未在截止时间前完成，租户ID：'+', '.join(pending[:12])}
+        return {'status':'pending','message':'合并正在进行/待完成，租户ID：'+', '.join(pending[:12])}
+    if completed and len(completed)==len(rows):
+        return {'status':'success','message':f'全部 {len(completed)} 个租户今日合并已完成'}
+    if completed:
+        return {'status':'unknown','message':f'今日已完成 {len(completed)}/{len(rows)} 个租户；其余未确认今日发生合并'}
+    return {'status':'unknown','message':'未发现今日新发起或完成的合并，未判定故障'}

@@ -1,270 +1,99 @@
-# OB 运维监控平台部署说明
+# 部署、迁移与回滚
 
-本文档用于现场部署 `gjzqdb-ops-monitor`。系统通过 OCP API 只读获取 OB 集群信息，不修改 OCP 原有配置；本系统自己的数据写入 Oracle 19c PDB 资产库。
+所有示例均使用占位配置。不要提交真实 config.json、日志、密钥或资产导出。本文不会自动连接或修改任何服务器。
 
-## 1. 部署架构
+## 1. 配置
 
-- Web 服务：Flask + Gunicorn
-- 数据库：Oracle 19c PDB
-- OCP 接口：只读调用 `GET /api/v2/info` 与 `GET /api/v2/ob/clusters`
-- OB 接口：只读 SQL 采集，仅允许 `SELECT`
-- 默认端口：`8000`
-- 推荐系统：RHEL 7.9
-- 应用日志：默认写入程序目录 `logs/ob-ops-monitor.log`
+在 Linux 安装目录创建虚拟环境并安装 requirements.txt，复制 config.example.json 为 config.json，填写 Oracle 资产库账号和 DSN。Oracle 账号需具备部署所需的建表/索引权限，日常 OB 采集账号仅使用所需视图的只读权限。各集群 SYS 凭据通过平台现有配置保存，不写入源码。
 
-## 2. Oracle PDB 准备
+以下假设安装目录为 `/root/gjzqdb`，与 deploy/ 中模板一致。安装在其他位置时同时修改 unit 的 WorkingDirectory、ExecStart、运行账号及配置路径。Web 端口示例为 8000，按现有网络策略限制访问；此应用未内置完整登录与访问控制。
 
-现场信息：
+## 2. 初始化或升级 Oracle 资产库
 
-- Oracle 地址：`10.50.40.182`
-- PDB/Service Name：`gjzqdb`
-- 业务用户：`gjzqdbsys`
-- 密码：部署时手动输入，不写入文档
+新库与已有库二选一。执行前确认 APP_CONFIG/环境变量确实指向目标资产库。
 
-如 `gjzqdbsys` 用户尚未创建，使用具备 DBA 权限的账号执行：
+新库初始化：
 
-```sql
-alter session set container = gjzqdb;
-
-create user gjzqdbsys identified by "现场输入的密码";
-grant create session, create table, create sequence, create view to gjzqdbsys;
-grant unlimited tablespace to gjzqdbsys;
+```sh
+cd /root/gjzqdb
+.venv/bin/python -c 'from app import init_db; init_db()'
 ```
 
-如现场已有专用用户，可以跳过创建用户步骤，但需要保证该用户具备建表、建序列、建视图和连接权限。
+已有库增量升级（先打印审阅，再明确执行）：
 
-## 3. 上传程序包
-
-将部署包上传到服务器，例如：
-
-```bash
-mkdir -p /opt/ob-asset
-tar -xzf gjzqdb-ops-monitor-deploy.tar.gz -C /opt/ob-asset --strip-components=1
-cd /opt/ob-asset
+```sh
+.venv/bin/python schema_migrate.py
+.venv/bin/python schema_migrate.py --apply
+.venv/bin/python migrate_inspection.py --apply
+.venv/bin/python schema_preflight.py
 ```
 
-## 4. 安装 Python 依赖
+增量包括 ACTIVE、合并检查、CPU 计数器/租户样本、缺失确认、CPU 状态以及 SYS CPU 历史表/索引。`migrate_sys_cpu.py` 仅负责 SYS CPU 表/索引子集；不必在完整 schema_migrate 后重复执行。migrations/ 下 SQL 文件可由 DBA 审阅后替代对应 Python 迁移，注意完整增量 SQL 与 SYS 子集范围不同。
 
-```bash
-sudo yum install -y python3
+Oracle DDL 自动提交，不能用事务 ROLLBACK 撤销。重复运行仅忽略已有对象/列错误，不验证同名对象结构；schema_preflight 会报告缺字段、类型、关键约束及 ACTIVE 异常值。不会批量重置 ACTIVE、恢复计划或删除历史。
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+如果停用状态可疑，先运行只读核查：
+
+```sh
+.venv/bin/python audit_tenant_inventory.py
 ```
 
-依赖包括：
+仅对源端仍存在且本地已停用的明确租户逐项决定恢复方式，不将所有 ACTIVE 或计划 ENABLED 统一设为 1。
 
-- Flask
-- gunicorn
-- oracledb
-- requests
+## 3. Web
 
-`python-oracledb` 默认使用 Thin 模式，通常不需要安装 Oracle Instant Client。
+沿用现有服务管理方式，示例手动启动：
 
-## 5. 修改配置文件
-
-复制配置模板：
-
-```bash
-cp config.example.json config.json
-vi config.json
+```sh
+cd /root/gjzqdb
+mkdir -p logs
+nohup /root/gjzqdb/.venv/bin/gunicorn --chdir /root/gjzqdb \
+  -w 2 --timeout 180 -b 0.0.0.0:8000 app:app >> logs/gunicorn.log 2>&1 &
+curl -sS http://127.0.0.1:8000/api/health
 ```
 
-配置文件内容示例：
+不要使用 python app.py 作为生产启动方式，该入口含开发 debug 和初始化行为。升级应完整部署相关模块、静态文件和模板，保留现场配置与虚拟环境，然后重载实际 Web 服务。手动 Gunicorn、没有 --preload 时可向经核验的主进程发送 HUP；由 systemd 管理的 Web 使用原服务的重启方式，不批量终止其他应用进程。
 
-```json
-{
-  "oracle": {
-    "user": "gjzqdbsys",
-    "password": "请在这里填写数据库密码",
-    "dsn": "10.50.40.182:1521/gjzqdb",
-    "pool": {
-      "min": 1,
-      "max": 5,
-      "increment": 1
-    }
-  },
-  "app": {
-    "port": 8000,
-    "log_dir": "logs",
-    "default_ocp_version": "4.3.5-20250610160438",
-    "default_ob_version": "4.2.1.8"
-  }
-}
+## 4. 自动采集
+
+部署前核对四个 unit 的路径、账号、TZ、配置来源。新增定时器不会自动安装，需明确执行：
+
+```sh
+cp deploy/ob-cpu-history.service deploy/ob-cpu-history.timer /etc/systemd/system/
+cp deploy/ob-homepage-hourly.service deploy/ob-homepage-hourly.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ob-cpu-history.timer ob-homepage-hourly.timer
+systemctl start ob-cpu-history.service
+systemctl start ob-homepage-hourly.service
 ```
 
-密码包含特殊字符时可以直接写在 JSON 字符串里。只需注意：
+- CPU 每 5 分钟触发，按集群锁和 290 秒检查防重复。第一次仅建立基线，至少两次有效采样才有历史。
+- 首页每小时刷新 SYS/合并、集群/租户清单与状态、备份/资源/磁盘/参数及已启用日志源，保留手工入口。OCP 资产导入不自动执行。
+- 原 run_tenant_schedules.py 可继续由已有 cron 调用，保留每日集群与租户专项计划，并检查小时基础任务是否到期。小时任务与原调度共用本机锁，数据库任务记录避免重复小时批次；每日/专项计划可能额外执行。
+- 已停用日志源及租户专项计划不被自动开启，缺少 SYS 凭据的集群会跳过并记录。停采租户保留历史，不显示在 CPU 选项中。
+- CPU 专用服务独立于长耗时的首页/租户任务；小时任务等待原调度锁，最长运行时限见 service。
 
-- 如果密码里包含双引号 `"`，写成 `\"`
-- 如果密码里包含反斜杠 `\`，写成 `\\`
+检查调度与真实样本时间：
 
-例如密码是 `Abc"123\xyz`，JSON 中写成：
-
-```json
-"password": "Abc\"123\\xyz"
+```sh
+systemctl list-timers --all | grep -E 'ob-cpu-history|ob-homepage-hourly'
+journalctl -u ob-cpu-history.service -n 60 --no-pager
+journalctl -u ob-homepage-hourly.service -n 60 --no-pager
+curl -sS http://127.0.0.1:8000/api/cpu-history/status
 ```
 
-## 6. 初始化资产库
+服务正常退出也可能表示本轮因间隔不足而跳过。CPU 状态页目前需手工刷新；不要用停留页面的时间判断后台停采。
 
-首次部署执行：
+## 5. 验收
 
-```bash
-source .venv/bin/activate
-python -c "from app import init_db; init_db(seed=True)"
-```
+核对集群数量、SYS 列表及合并原因、风险卡片/明细/导出数量一致。对 ACTIVE 停用流程验证完整/空/失败/部分清单，至少两次确认且间隔 30 分钟才软停采；验证重新出现不自动恢复旧计划。某个指标查询失败不应清空已知备份/资源数据。
 
-该命令会自动创建以下表：
+检查 CPU 普通/SYS 样本、meta 显示开关、隐藏停采租户、7/14/30/60 天、缺采断线和 CSV，并与 OCP 同时间段对照。抽查原资源饼图、详情、十大对象、运行指标、计划、日志和 OCP 同步。离线测试不能替代这些现场验收。
 
-- `clusters`
-- `servers`
-- `ob_servers`
-- `tenants`
-- `databases`
-- `collection_jobs`
-- `ob_log_events`
-- `ocp_connections`
-- `ocp_sync_runs`
+## 6. 保留数据回滚
 
-重复执行通常不会破坏已有数据。
+暂停新定时器及正在运行的对应采集服务；恢复上线前已验证的完整源码和原服务配置，保留现场 config.json；重载 Web 并恢复原调度。保留扩展表及 CPU 历史，不默认 DROP，不批量改 ACTIVE。若需恢复特定租户/计划状态，使用明确记录和源端只读核验逐项处理。DDL 回滚或整库恢复另行评估，不混入源码替换操作。
 
-## 7. 启动服务
+## 7. 每日巡检新增迁移
 
-测试启动：
-
-```bash
-source .venv/bin/activate
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
-```
-
-查看服务器侧错误日志：
-
-```bash
-tail -f logs/ob-ops-monitor.log
-```
-
-浏览器访问：
-
-```text
-http://服务器IP:8000/
-```
-
-## 8. OCP 接入
-
-页面点击“ OCP接入 ”，填写：
-
-- OCP 地址：例如 `https://ocp.example.com`
-- OCP 版本：默认 `4.3.5-20250610160438`
-- API 前缀：默认 `/api/v2`
-- 认证方式：账号密码或 Bearer Token
-- 如果 OCP 使用自签名证书，可以取消“校验HTTPS证书”
-
-保存后系统会测试：
-
-```text
-GET /api/v2/info
-```
-
-点击“同步OCP”后系统会读取：
-
-```text
-GET /api/v2/ob/clusters
-```
-
-同步结果只写入本系统 Oracle 资产库，不会修改 OCP。
-
-## 9. 功能说明
-
-- 首页运维全景：展示物理机、虚拟机、故障主机、报警主机、正常主机。
-- Sys 租户健康：首页展示所有集群 sys 租户最近一次检查结果，支持手工立即检查。
-- OB 集群看板：展示集群、租户、数据库、OBServer 摘要。
-- OCP 接入配置：保存 OCP 地址、认证方式、版本和 API 前缀。
-- OCP 同步：从 OCP 读取 OB 集群信息并写入 `clusters` 表。
-- 手工 OB 集群采集：对目标 OB SQL 入口只执行 `SELECT`，读取租户、OBServer、参数等信息并写入本系统 Oracle 资产库。
-- 租户详情采集：MySQL 模式租户使用 PyMySQL；Oracle 模式租户默认调用 `obclient`。两者用户名都按 `用户@租户#集群` 拼接，只执行只读 SQL。
-- 日志捕获：粘贴 OB 日志，解析 `WARN`、`ERROR`、`FATAL`、`OB-xxxx`、`ORA-xxxx` 并写入 `ob_log_events`。
-- 采集任务与错误：Web 只显示成功/失败摘要；详细错误写入 `logs/ob-ops-monitor.log`。
-
-Oracle 模式租户需要服务器能直接执行 `obclient`：
-
-```bash
-which obclient
-obclient -h192.168.62.62 -P12883 -u'SYS@thdgxtdb#nqlobcluster' -p -A
-```
-
-如果 `obclient` 不在 PATH，可以设置：
-
-```bash
-export OBCLIENT_BIN=/path/to/obclient
-```
-
-默认不需要设置 `OB_ORACLE_TENANT_DRIVER`。只有现场明确改用其它驱动时才设置为 `oracledb` 或 `pymysql`。
-
-## 10. 定时采集
-
-页面集群列表中的“定时采集”用于配置集群级每日只读采集，只需要设置每天执行时间；“只读采集”按钮仍可随时手工执行。
-
-租户详情页中的定时采集用于采集租户对象容量和运行指标。
-
-sys 租户健康检查默认每 60 分钟执行一次，可在 `config.json` 中调整：
-
-```json
-"app": {
-  "sys_check_interval_minutes": 60
-}
-```
-
-建议使用 cron 每分钟调用一次调度脚本，脚本会自动判断当天是否到达配置时间并避免重复执行：
-
-```bash
-* * * * * cd /opt/ob-asset && . .venv/bin/activate && python run_tenant_schedules.py >> logs/schedule.log 2>&1
-```
-
-## 11. 只读原则
-
-- 对 OCP：程序只发起 `GET` 请求，不创建、不更新、不删除 OCP 配置。
-- 对 OB：程序只执行 `SELECT` 语句，不执行 `INSERT`、`UPDATE`、`DELETE`、`ALTER`、`DROP`、`CREATE`、`SET` 等变更语句。
-- 对本系统 Oracle 资产库：允许写入本系统自己的资产表、配置表和采集任务表。
-
-## 12. 常见问题
-
-### 页面能打开，但显示演示数据
-
-通常表示后端无法连接 Oracle。检查：
-
-```bash
-python -c "from app import ORACLE_USER, ORACLE_DSN; print(ORACLE_USER, ORACLE_DSN)"
-python -c "from app import get_pool; db=get_pool().acquire(); print('oracle ok'); db.close()"
-```
-
-### OCP HTTPS 证书报错
-
-如果 OCP 使用自签名证书，可以在页面 OCP 配置里取消“校验HTTPS证书”。
-
-### OCP 同步没有集群
-
-检查 OCP 账号权限，以及现场 OCP 的集群接口返回结构。当前代码主要适配：
-
-```text
-/api/v2/ob/clusters
-```
-
-如现场字段不同，需要调整 `ocp_collector.py` 中的 `normalize_ocp_clusters()`。
-
-### Web 页面只显示失败摘要
-
-这是设计行为，避免把数据库地址、账号、异常堆栈暴露在浏览器。请在服务器上查看：
-
-```bash
-tail -f logs/ob-ops-monitor.log
-```
-
-### 生产服务建议
-
-建议后续补充：
-
-- systemd 服务托管
-- Nginx 反向代理
-- 登录认证
-- OCP 密码和 Token 加密存储
-- OCP 主机、OBServer、租户、数据库、告警、指标接口映射
+当前版本还需审阅并执行 `python migrate_inspection.py --apply`，新增巡检配置、身份锁和每日尝试记录。新库 `init_db()` 已包含这些表；已有库的 schema_migrate 仍只负责原基础扩展，不替代每日巡检迁移。默认不启用登录。安装、预算和确认规则详见 [DAILY_INSPECTION.md](DAILY_INSPECTION.md)。

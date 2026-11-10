@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CPU 历史分析 · OB 运维监控平台</title>
+<link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/cpu_history.css">
+</head>
+<body class="cpu-page">
+<header class="topbar"><div><p class="eyebrow">OCEANBASE · 运行分析</p><h1>租户 CPU 历史分析</h1><p>从集群到租户，观察资源使用趋势与采集覆盖情况。</p></div><a class="back-link" href="/">← 运维总览</a></header>
+<main class="cpu-main">
+<section class="cpu-panel"><div class="cpu-heading"><div><h2>采集运行状态</h2><p>每 5 分钟自动采样。首次建立基线，第二次有效采样开始生成历史。</p></div><button id="refreshStatus">刷新状态</button></div><div id="collectionStatus" class="collection-status" role="status">正在读取…</div></section>
+<section class="cpu-panel"><div class="cpu-heading"><div><h2>分析范围</h2><p>最多同时对比 12 个租户；支持 SYS 租户，meta 默认隐藏；已停采租户不再显示。</p></div><label>时间范围 <select id="days"><option value="7">最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option></select></label></div>
+<div class="cpu-controls"><label>集群 <select id="clusterFilter"><option value="">全部集群</option></select></label><label class="cpu-search">搜索租户 <input id="tenantSearch" type="search" placeholder="输入租户名称"></label><label class="cpu-meta-switch"><input id="showMeta" type="checkbox" role="switch"> 显示 meta 租户</label><button id="selectAll">选中当前结果（最多12个）</button><button id="clearAll">清空选择</button></div>
+<div id="cpuChoices" class="cpu-choices">正在加载租户…</div><div class="cpu-controls"><span id="selectedCount">已选 0 个租户</span><button id="refreshCpu" class="primary">查询历史</button><button id="exportCsv">导出小时数据</button></div><p id="cpuStatus" role="status" class="cpu-note"></p></section>
+<div class="cpu-kpis"><article><span>有数据的租户</span><strong id="tenantCoverage">—</strong></article><article><span>有效采样数</span><strong id="sampleTotal">—</strong></article><article><span>最高采样使用率</span><strong id="peakCpu">—</strong></article></div>
+<section class="cpu-panel"><div class="cpu-heading"><div><h2>CPU 使用率趋势</h2><p>按租户配额归一化 · 小时平均 · 悬停数据点查看数值</p></div><span class="cpu-note">空白表示缺采，不补零</span></div><div id="cpuPlot" class="cpu-plot"></div><div id="cpuLegend" class="cpu-legend"></div></section>
+<section class="cpu-panel"><h2>租户统计</h2><div class="table-wrap"><table><thead><tr><th>集群 / 租户</th><th>有数据小时</th><th>平均 CPU 使用率</th><th>最高采样使用率</th><th>平均使用核数</th><th>平均配额核数</th><th>有效采样数</th></tr></thead><tbody id="cpuSummary"></tbody></table></div><p class="cpu-note">小时统计由有效区间样本汇总；下表按采样数加权。最高值是采样区间平均值的最大值，不代表瞬时峰值。配额变更、计数器重置或超过 15 分钟的缺口会重新建立基线。</p></section>
+<p class="cpu-footnote">历史从部署后的首次成功采样开始，无法还原部署前 60 天数据。可查询最近 60 天；本版本不自动删除历史数据。</p>
+</main><script src="/static/cpu_history.js"></script></body></html>

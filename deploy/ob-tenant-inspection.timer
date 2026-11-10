@@ -1,0 +1,9 @@
+[Unit]
+Description=Check tenant inspection daily schedule and manual queue
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
